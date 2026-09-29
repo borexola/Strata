@@ -315,14 +315,26 @@ def find_nvcc():
     return best
 
 
+VS_UNSUPPORTED = False                                   # the Visual Studio found is newer than CUDA's nvcc accepts
+
+
 def find_vcvars():
+    """The Visual Studio (Build Tools count) whose compiler CUDA's nvcc accepts: 2019 or 2022 (versions 16 and 17).
+    CUDA 13.0 refuses a newer one ("unsupported Microsoft Visual Studio version"), so a Visual Studio 2026 installed
+    next to the 2022 Build Tools must not win just for being the newest.  Only when no supported one exists is the
+    newest taken, with nvcc's override flag and a warning (cmake_build)."""
+    global VS_UNSUPPORTED
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    p = out([str(vswhere), "-latest", "-products", "*", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
-    v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
-    return v if v and v.exists() else None
+    for version, unsupported in ((["-version", "[16.0,18.0)"], False), ([], True)):
+        p = out([str(vswhere), "-latest", "-products", "*", *version, "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+        v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
+        if v and v.exists():
+            VS_UNSUPPORTED = unsupported
+            return v
+    return None
 
 
 def find_tool(name):
@@ -656,6 +668,22 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install cmake ninja")
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
+    if WIN and vcvars is not None:
+        if VS_UNSUPPORTED:
+            warn("this Visual Studio is newer than the CUDA toolkit supports (2019/2022): compiling with nvcc's "
+                 "-allow-unsupported-compiler; install the Visual Studio 2022 Build Tools if the build fails")
+            conf.append("-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler")
+        # A build folder configured with another Visual Studio's compiler (one installed since) keeps that
+        # compiler in its cache while vcvars sets up the other one's headers, and every file then fails with
+        # "Unexpected compiler version" (STL1001): such a folder is configured again from scratch.
+        cache = bdir / "CMakeCache.txt"
+        if cache.exists():
+            root = os.path.normcase(str(Path(vcvars).parents[3]))
+            m = re.search(r"^CMAKE_CXX_COMPILER:FILEPATH=(.*)$", cache.read_text(encoding="utf-8", errors="replace"), re.M)
+            if m and not os.path.normcase(m.group(1).strip()).startswith(root):
+                say("  The build folder was set up with another compiler: configuring it again ...")
+                cache.unlink()
+                shutil.rmtree(bdir / "CMakeFiles", ignore_errors=True)
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.

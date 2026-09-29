@@ -163,6 +163,9 @@ Python 3.12 if you have none (for your user account, no admin), a private Python
 (from pip, ~0.4 GB), the ready-made Strata engine for RTX 30/40/50, the model and the MTP draft layer. If no
 ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
 Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
+On Windows the compile uses Visual Studio 2019 or 2022 (the Build Tools count) even when a newer Visual Studio is
+installed too: CUDA's nvcc refuses a newer one ("unsupported Microsoft Visual Studio version"). With only a newer one
+it compiles with nvcc's override flag and says so.
 
 ---
 
