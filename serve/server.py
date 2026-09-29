@@ -24,6 +24,7 @@ import argparse
 import collections
 import base64
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -456,6 +457,51 @@ class Vision:
             self.proc.kill()
 
 
+def nvidia_gpu_indices() -> list[int] | None:
+    """The NVIDIA GPUs' numbers as nvidia-smi numbers them (by PCI bus), or None when nvidia-smi cannot say."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    found = []
+    for line in r.stdout.splitlines():
+        try:
+            found.append(int(line.strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def check_gpu(cfg: dict) -> None:
+    """A config written on a PC with several GPUs pins the engine to one of them ("gpu": N).  After that card was
+    removed, or the PC was rebuilt around one GPU, N may not exist any more: CUDA_VISIBLE_DEVICES=N then hides every
+    card and the engine fails to start.  The pin is dropped (the one card, or the driver's first, is used) and
+    the config is corrected, so the next start does not warn again."""
+    if cfg.get("gpu") is None:
+        return
+    have = nvidia_gpu_indices()
+    if have is None or not have or cfg["gpu"] in have:
+        return
+    print(f"[strata] the config names GPU {cfg['gpu']}, which this PC does not have (found: "
+          f"{', '.join(str(i) for i in have)}): using GPU {have[0]}", flush=True)
+    cfg["gpu"] = have[0]
+    if len(have) == 1:
+        del cfg["gpu"]                                  # one card: no pin needed (as a fresh install writes it)
+    path = cfg.get("_path")
+    if path:
+        try:
+            on_disk = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+            on_disk.pop("gpu", None)
+            if "gpu" in cfg:
+                on_disk["gpu"] = cfg["gpu"]
+            Path(path).write_text(json.dumps(on_disk, indent=1), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -496,19 +542,20 @@ class ByteTokenizer:
 
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
-    """Incremental decode: re-decode the generated ids and emit only the new, complete suffix (a multi-byte
-    character split across tokens is held until complete)."""
+    """Incremental decode: only the ids not yet emitted are decoded (a multi-byte character split across tokens
+    is held until complete).  Decoding EVERY generated id on each token was quadratic: 2 ms per token at 10K
+    tokens, 4 ms at 20K - a third of the token budget by the end of a long thinking block."""
 
     def __init__(self, tok):
-        self.tok, self.ids, self.sent = tok, [], 0
+        self.tok, self.pending = tok, []
 
     def push(self, t: int) -> str:
-        self.ids.append(t)
-        text = self.tok.decode(self.ids)
-        if text.endswith("�"):
+        self.pending.append(t)
+        text = self.tok.decode(self.pending)
+        if text.endswith("\ufffd"):            # a character cut between tokens: wait for the rest of it
             return ""
-        delta, self.sent = text[self.sent:], len(text)
-        return delta
+        self.pending = []
+        return text
 
 
 class Service:
@@ -1094,7 +1141,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if given == svc.api_key:
+            if hmac.compare_digest(given.encode("utf-8", "replace"), svc.api_key.encode("utf-8", "replace")):
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -1479,6 +1526,10 @@ def main() -> int:
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = a.gpu
+    elif a.config and cfg.get("gpu") is not None:
+        cfg["_path"] = a.config
+        check_gpu(cfg)                                  # a pin to a GPU this PC no longer has
+        cfg.pop("_path", None)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

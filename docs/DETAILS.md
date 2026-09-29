@@ -293,9 +293,9 @@ print(r.choices[0].message.content)
   `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
   `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
-  `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
-  can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
-  `--fit-max-tokens` to `serve/server.py`). A prompt that leaves no room at all is still refused.
+  `max_tokens` would run past the context gets its answer shortened to the room left (agents always ask for their
+  full output cap): setup writes `"fit_max_tokens": true` into `strata-<model>.json`; set it to `false` to get a 400
+  instead, like llama.cpp. A prompt that leaves no room at all is still refused.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
   `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
@@ -323,9 +323,10 @@ between two chats re-reads the part where they diverge; the shared prefix, such 
 only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
-engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
-(`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win, and with no
-block at all a request without sampling keys decodes greedy. The penalties (`presence_penalty`, `frequency_penalty`,
+engine arguments. The run config's `sampling` block sets the defaults for requests that leave the fields out; setup
+writes the model's recommended `{"temperature": 0.6, "top_p": 0.95, "top_k": 20}` (API clients used to decode greedy,
+which loops in long thinking). A request's own fields always win (an explicit `temperature: 0` is greedy), and with
+no block at all a request without sampling keys decodes greedy. The penalties (`presence_penalty`, `frequency_penalty`,
 `repetition_penalty`, with `penalty_last_n` capping how many recent tokens they count over, default 64 when any
 penalty is set) ride the same path; they count the tokens the request has consumed, so a repetition penalty
 suppresses what the model itself just said, not the prompt alone. Since engine 0.1.19 they apply to every token

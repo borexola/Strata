@@ -108,6 +108,9 @@ ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Ne
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "strata.exe" if WIN else "strata"
+# the sampling the model's authors recommend (thinking mode), for API clients that send no sampling fields; the
+# web app sends the same
+SAMPLING_DEFAULTS = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 VEXE = "strata-vision.exe" if WIN else "strata-vision"
 
 
@@ -957,7 +960,8 @@ def is_wsl() -> bool:
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
-    g = gpu_info(cfg.get("gpu")) or {}
+    found = gpus()                                     # the pinned card, or (after a rebuild) the one with the most VRAM
+    g = next((x for x in found if x["index"] == cfg.get("gpu")), None) or (gpu_info() or {})
     a = cfg.get("args", [])
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
     return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
@@ -1018,6 +1022,23 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         del a[i:i + 2]
         changed = True
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
+    if "sampling" not in cfg:                          # configs before the sampling defaults: API clients decoded greedy
+        cfg["sampling"] = dict(SAMPLING_DEFAULTS)
+        changed = True
+        ok("sampling defaults for API clients that send none: " + ", ".join(f"{k} {v}" for k, v in SAMPLING_DEFAULTS.items()))
+    if "fit_max_tokens" not in cfg:
+        cfg["fit_max_tokens"] = True
+        changed = True
+        ok("a request whose max_tokens does not fit the context gets a shorter answer instead of an error")
+    if cfg.get("gpu") is not None:                     # pinned to a card this PC no longer has (a rebuild around one GPU)
+        found = gpus()
+        if found and cfg["gpu"] not in [g["index"] for g in found]:
+            warn(f"the config names GPU {cfg['gpu']}, which this PC does not have: using GPU {found[0]['index']}")
+            if len(found) == 1:
+                del cfg["gpu"]
+            else:
+                cfg["gpu"] = found[0]["index"]
+            changed = True
     if changed:
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     return cfg
@@ -1412,7 +1433,11 @@ def main() -> int:
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port}
+           "lib_dirs": lib_dirs, "port": port,
+           # the model's recommended sampling for API clients that send none (they decoded greedy before, which
+           # loops in long thinking); a request's own fields always win.  A request whose prompt + max_tokens
+           # exceeds the context gets a shorter answer instead of a 400 (coding agents ask for 32-64K).
+           "sampling": dict(SAMPLING_DEFAULTS), "fit_max_tokens": True}
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
     if a.host:
