@@ -272,6 +272,20 @@ def main() -> int:
     base = pathlib.Path(a.base).resolve() if a.base else None
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    # This tool always writes native_experts.txt BEFORE experts.bin, so an experts.bin without that marker beside
+    # it is another tool's arena (strata_pack.py's canonical layout, whose manifest.json says "strata-pack").  The
+    # engine reads experts.bin in the native layout as soon as native_experts.txt exists: writing the marker next
+    # to a canonical arena of the same size would make it serve garbage as experts.  Refuse before touching anything.
+    canonical = False
+    if (out / "manifest.json").exists():
+        try:
+            canonical = json.loads((out / "manifest.json").read_text(encoding="utf-8")).get("format") == "strata-pack"
+        except (OSError, ValueError):
+            canonical = False
+    if (out / "experts.bin").exists() and (canonical or not (out / "native_experts.txt").exists()):
+        print("%s holds a canonical pack (experts.bin not written by iq_pack.py): use a separate --out folder, "
+              "or delete that pack first" % out)
+        return 1
 
     g = G.GGUFFile(src)
     mm = np.memmap(src, dtype=np.uint8, mode="r")
@@ -308,18 +322,26 @@ def main() -> int:
         blob = per[0] + per[1] + per[2]
         layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
         offset += blob * n_expert
+    lines = []                                           # checked in full before the file is written
+    for l, gt, dt, off, blob, ts in layout:
+        ws = [model.where[t.name] for t in ts]
+        if len({w[3] for w in ws}) != 1:
+            print("layer %d: its gate/up/down tensors are in different shards" % l)
+            return 1
+        gg, shard = ws[0][0], ws[0][3]
+        if shard != src and any(c.isspace() for c in shard.name):
+            # the engine reads the line with `ss >> file`: a name with whitespace would be cut at the first blank
+            print("shard %r: its name contains whitespace, which native_experts.txt cannot carry; rename the "
+                  "model's shards first" % shard.name)
+            return 1
+        line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *[gg.data_start + t.offset for t in ts])
+        lines.append(line + ("" if shard == src else " " + shard.name))
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                  "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
                  % (n_expert, offset, src.name))
-        for l, gt, dt, off, blob, ts in layout:
-            ws = [model.where[t.name] for t in ts]
-            if len({w[3] for w in ws}) != 1:
-                print("layer %d: its gate/up/down tensors are in different shards" % l)
-                return 1
-            gg, shard = ws[0][0], ws[0][3]
-            line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *[gg.data_start + t.offset for t in ts])
-            fo.write(line + ("" if shard == src else " " + shard.name) + "\n")
+        for line in lines:
+            fo.write(line + "\n")
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)

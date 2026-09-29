@@ -13,7 +13,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from _paths import add_gguf_py
-add_gguf_py()
+try:
+    add_gguf_py()
+except SystemExit as e:              # no gguf-py here: skip these tests, not the whole run (pytest: INTERNALERROR)
+    raise unittest.SkipTest(str(e)) from None
 from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
 import iq_pack
 

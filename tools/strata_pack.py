@@ -225,8 +225,17 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
     # the expert arena and the dense tensors come from the same file: point pack_layer at it
     PL.SHARD1 = pathlib.Path(gguf).resolve()
     shard2 = pathlib.Path(str(PL.SHARD1).replace("00001-of-00002", "00002-of-00002"))
-    man["source"]["shard2"] = str(shard2)
+    # a --gguf without the split suffix has no shard 2 (the replace changed nothing; do not read shard 1 twice)
+    has_shard2 = shard2 != PL.SHARD1 and shard2.exists()
+    man["source"]["shard2"] = str(shard2) if has_shard2 else None
     exp_path = out_dir / "experts.bin"
+    # A native pack (tools/iq_pack.py) leaves native_experts.txt beside ITS experts.bin, and the engine reads
+    # experts.bin in the native layout whenever that file exists.  The canonical arena written here has another
+    # layout, so a stale marker from an earlier native pack in the same folder must go with the old arena.
+    for stale in ("native_experts.txt", "compat-bf16.json"):
+        if (out_dir / stale).exists():
+            print("removing stale %s (from a native pack in the same folder)" % stale)
+            (out_dir / stale).unlink()
     print("experts.bin: %d layers, %.2f GiB" % (n_layers, n_layers * PL.NE * PL.BLOB_BYTES / 2**30))
     em = PL.build(n_layers, exp_path)
     man["experts"] = {"blob_bytes": em["blob_bytes"], "offsets": em["offsets"],
@@ -266,11 +275,15 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
     if not skip_hash:
         print("hashing shards (this is the slow part)...")
         man["source"]["shard1_sha256"] = sha256(gguf)
-        man["source"]["shard2_sha256"] = sha256(shard2) if shard2.exists() else None
+        man["source"]["shard2_sha256"] = sha256(shard2) if has_shard2 else None
     # shard 2 is NOT copied: the PLE table stays where it is and the manifest records how to find it
-    if shard2.exists():
+    if has_shard2:
         g2 = G.GGUFFile(shard2)
-        t2 = [t for t in g2.tensors if t.name == "per_layer_token_embd.weight"][0]
+        t2 = next((t for t in g2.tensors if t.name == "per_layer_token_embd.weight"), None)
+        if t2 is None:
+            print("%s: no per_layer_token_embd.weight in shard 2 - refusing to write a manifest that cannot "
+                  "name the PLE table" % shard2.name)
+            return 1
         man["shard2_tensor"] = {"name": t2.name, "type": t2.type_name, "shape": list(t2.shape),
                                 "offset": t2.offset, "elements": t2.elements,
                                 "path": str(shard2)}

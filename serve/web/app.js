@@ -401,7 +401,7 @@ function blocks(text) {
     let m;
     if (!l.trim()) { flushPara(); flushList(); continue; }
     if ((m = l.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); flushList(); out.push(`<${m[1].length <= 2 ? "h3" : "h4"}>${inline(m[2])}</${m[1].length <= 2 ? "h3" : "h4"}>`); continue; }
-    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(l)) { flushPara(); flushList(); out.push("<hr>"); continue; }
+    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(l)) { flushPara(); flushList(); out.push("<hr>"); continue; }
     if ((m = l.match(/^>\s?(.*)$/))) { flushPara(); flushList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
     if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
       flushPara(); flushList();
@@ -430,13 +430,15 @@ function blocks(text) {
 function markdown(text) {
   let html = "", rest = text;
   for (;;) {
-    const m = rest.match(/(^|\n)```([^\n`]*)\n/);
+    const m = rest.match(/(^|\n)(`{3,})([^\n`]*)\n/);
     if (!m) { html += blocks(rest); break; }
     html += blocks(rest.slice(0, m.index));
     rest = rest.slice(m.index + m[0].length);
-    const end = rest.match(/(^|\n)```[ \t]*(\n|$)/);
-    if (!end) { html += codeBlock(m[2].trim(), rest); break; }         // still streaming
-    html += codeBlock(m[2].trim(), rest.slice(0, end.index));
+    // the closing fence is at least as long as the opening one (fileBlock uses longer fences when the file itself
+    // contains ```; models do the same)
+    const end = rest.match(new RegExp(`(^|\\n)\`{${m[2].length},}[ \\t]*(\\n|$)`));
+    if (!end) { html += codeBlock(m[3].trim(), rest); break; }         // still streaming
+    html += codeBlock(m[3].trim(), rest.slice(0, end.index));
     rest = rest.slice(end.index + end[0].length);
   }
   return html;
@@ -762,7 +764,11 @@ $("new-btn").onclick = () => {
   messages = [];
   saveChat();
   renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
+  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => {
+    // the same guard as the button: a stream in flight writes into the current chat and saves it when it ends
+    if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+    messages = backup; saveChat(); renderChat();
+  }});
 };
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }

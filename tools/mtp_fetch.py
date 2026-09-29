@@ -78,18 +78,37 @@ def inventory(out):
     return rows
 
 
+def safe_name(name):
+    """A tensor name is a file name here; the index is downloaded, so it must not be able to leave `tensors/`."""
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        sys.exit("refusing tensor name %r: it is not a plain file name" % name)
+    return name
+
+
 def fetch(out, only):
     inv_path = os.path.join(out, "mtp-inventory.json")
     rows = json.load(open(inv_path))["tensors"] if os.path.exists(inv_path) else inventory(out)
     tdir = os.path.join(out, "tensors")
     os.makedirs(tdir, exist_ok=True)
-    manifest = []
+    man_path = os.path.join(out, "mtp-manifest.json")
+    # `--only` fetches a subset: merge into the manifest already there, or a later mtp_pack would take a
+    # manifest that names only the tensors of the last fetch and pack an MTP file missing the rest
+    manifest = {}
+    if os.path.exists(man_path):
+        old = json.load(open(man_path))
+        manifest = {r["name"]: r for r in old} if isinstance(old, list) else {}
     chunk = 64 << 20
     for r in rows:
         if only and only not in r["name"]:
             continue
-        path = os.path.join(tdir, r["name"] + ".bin")
+        path = os.path.join(tdir, safe_name(r["name"]) + ".bin")
         have = os.path.getsize(path) if os.path.exists(path) else 0
+        if have > r["bytes"]:
+            # a leftover from another inventory (or a damaged file): nothing in it can be right, start it over
+            print("%s: %d bytes on disk but the tensor has %d; starting it over" % (path, have, r["bytes"]),
+                  file=sys.stderr)
+            os.truncate(path, 0)
+            have = 0
         with open(path, "ab") as f:
             pos = r["start"] + have
             while pos <= r["end"]:
@@ -102,10 +121,10 @@ def fetch(out, only):
             for block in iter(lambda: f.read(1 << 24), b""):
                 h.update(block)
         if os.path.getsize(path) != r["bytes"]:
-            sys.exit("%s: size %d != %d" % (path, os.path.getsize(path), r["bytes"]))
-        manifest.append(dict(r, file=os.path.relpath(path, out), sha256=h.hexdigest()))
-    with open(os.path.join(out, "mtp-manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=1)
+            sys.exit("%s: size %d != %d (delete the file and run fetch again)" % (path, os.path.getsize(path), r["bytes"]))
+        manifest[r["name"]] = dict(r, file=os.path.relpath(path, out), sha256=h.hexdigest())
+    with open(man_path, "w", encoding="utf-8") as f:
+        json.dump([manifest[k] for k in sorted(manifest)], f, indent=1)
 
 
 def main():

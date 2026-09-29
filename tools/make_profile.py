@@ -41,6 +41,8 @@ def read_trace(path, n_expert=N_EXPERT):
     while off + 8 <= len(blob):
         layer, k = struct.unpack_from("<ii", blob, off)
         off += 8
+        if k < 0 or off + 8 * k > len(blob):            # a truncated (or garbage) trace: keep what was whole
+            break
         for e in struct.unpack_from("<%di" % k, blob, off):
             if 0 <= layer < N_LAYER and 0 <= e < n_expert:
                 freq[(layer, e)] += 1

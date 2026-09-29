@@ -617,12 +617,22 @@ def open_shard(path):
 
 
 def data_section_offset(f, filelen: int) -> int:
-    """Byte offset of the tensor data, from the tensor table alone.
+    """Byte offset of the tensor data: the parsed header's `data_start`, cross-checked against the file length.
 
-    `filelen - max(offset + expected_bytes)` needs no header parsing and no dependency on ref/load.py's
-    private accessors.
+    `filelen - max(offset + expected_bytes)` used to be the answer on its own, but GGUF writers pad after EVERY
+    tensor to `general.alignment`, the last one included, so it is off by that padding whenever the last tensor's
+    size is not a multiple of the alignment - and every slice of the shard would then be shifted.  The header is
+    the source of truth; the file-length figure may exceed it by less than one alignment (the final padding), and
+    anything else means a truncated shard or a tensor type whose size this reader does not know.
     """
-    return filelen - max(x.offset + (x.expected_bytes() or 0) for x in f.tensors)
+    data_start = int(f.data_start)
+    end = max(x.offset + (x.expected_bytes() or 0) for x in f.tensors)
+    from_length = filelen - end
+    if not 0 <= from_length - data_start < f.alignment:
+        raise ValueError("%s: the tensor table does not match the file: data at byte %d, %d bytes of tensors, "
+                         "file %d bytes (alignment %d) - a truncated shard, or a tensor type of unknown size"
+                         % (getattr(f, "path", "shard"), data_start, end, filelen, f.alignment))
+    return data_start
 
 
 def run_full(args) -> int:

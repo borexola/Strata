@@ -33,6 +33,7 @@ import urllib.request
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
+MAX_MESSAGE = 64 << 20                # one JSON-RPC message (a stdout line, an HTTP body): more is a broken server
 
 
 class McpError(RuntimeError):
@@ -128,26 +129,43 @@ class StdioTransport:
                     print(f"[mcp {self.name}] {line}", flush=True)
 
     def _read(self):
-        for raw in self._lines(self.proc.stdout):
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:                           # a server that prints to stdout; the spec forbids it
-                self.stderr.append(line)
-                continue
-            for m in msg if isinstance(msg, list) else [msg]:
-                if isinstance(m, dict):
-                    self._dispatch(m)
-        self.ended = True
-        code = self.proc.poll()
-        err = McpError(f"the server stopped{f' (exit code {code})' if code is not None else ''}{self._tail()}")
-        with self.lock:
-            slots, self.pending = list(self.pending.values()), {}
-        for s in slots:
-            s.error = err
-            s.done.set()
+        # Whatever ends this loop - the pipe closing, an over-long line, an unexpected exception - the tail below
+        # must run: it is what fails the waiting calls and makes alive() false, so the server is started again.
+        # Without it a dead reader leaves every later call hanging to its timeout with nothing restarting it.
+        try:
+            f = self.proc.stdout
+            while True:
+                try:
+                    raw = f.readline(MAX_MESSAGE)
+                except (OSError, ValueError):            # the pipe closed (or close() closed it under us)
+                    break
+                if not raw:
+                    break
+                if len(raw) >= MAX_MESSAGE and not raw.endswith(b"\n"):
+                    self.stderr.append(f"a message longer than {MAX_MESSAGE >> 20} MB on stdout")
+                    break                                # a protocol error: the server ends here
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:                       # a server that prints to stdout; the spec forbids it
+                    self.stderr.append(line)
+                    continue
+                for m in msg if isinstance(msg, list) else [msg]:
+                    if isinstance(m, dict):
+                        self._dispatch(m)
+        except Exception as e:  # noqa: BLE001 - an unhashable id, MemoryError, ...: still end the transport
+            self.stderr.append(f"the reader failed: {e!r}")
+        finally:
+            self.ended = True
+            code = self.proc.poll()
+            err = McpError(f"the server stopped{f' (exit code {code})' if code is not None else ''}{self._tail()}")
+            with self.lock:
+                slots, self.pending = list(self.pending.values()), {}
+            for s in slots:
+                s.error = err
+                s.done.set()
 
     def _tail(self) -> str:
         return f": {self.stderr[-1][:300]}" if self.stderr else ""
@@ -165,7 +183,10 @@ class StdioTransport:
                     pass
             return                                       # notifications (log messages, list changes): not used
         with self.lock:
-            slot = self.pending.pop(m.get("id"), None)
+            try:
+                slot = self.pending.pop(m.get("id"), None)
+            except TypeError:                            # an unhashable id (a list): nothing waits for it
+                slot = None
         if slot is not None:                             # an answer to a call that timed out is simply dropped
             slot.msg = m
             slot.done.set()
@@ -189,6 +210,11 @@ class StdioTransport:
             self.pending[rid] = slot
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        except McpError:                                 # never sent: the slot would otherwise stay pending for good
+            with self.lock:
+                self.pending.pop(rid, None)
+            raise
+        try:
             return _wait(slot, timeout, cancel, method)
         except (McpTimeout, McpCancelled) as e:
             with self.lock:
@@ -281,9 +307,13 @@ class HttpTransport:
                     return
                 ctype = r.headers.get("Content-Type", "")
                 if "text/event-stream" in ctype:
-                    found = self._from_events(r, rid)
+                    found = self._from_events(r, rid, slot)
+                    if found is None and slot.done.is_set():
+                        return                           # the caller gave up (timeout, stop button): abandoned
                 else:
-                    body = r.read()
+                    body = r.read(MAX_MESSAGE + 1)
+                    if len(body) > MAX_MESSAGE:
+                        raise McpError(f"the server's answer is longer than {MAX_MESSAGE >> 20} MB")
                     found = None
                     parsed = json.loads(body) if body.strip() else None
                     for m in parsed if isinstance(parsed, list) else [parsed]:
@@ -314,10 +344,18 @@ class HttpTransport:
                 slot.done.set()
 
     @staticmethod
-    def _from_events(r, rid):
-        """Read the event stream until the event that answers `rid` (it may carry notifications first)."""
-        data = []
-        for raw in r:
+    def _from_events(r, rid, slot: _Slot):
+        """Read the event stream until the event that answers `rid` (it may carry notifications first), or until
+        the caller stopped waiting (`slot.done`): a server that keeps sending notifications after the deadline
+        would otherwise keep this thread reading for as long as it likes."""
+        data, size = [], 0
+        while not slot.done.is_set():
+            raw = r.readline(MAX_MESSAGE + 1)
+            if not raw:
+                break
+            size += len(raw)
+            if len(raw) > MAX_MESSAGE or size > MAX_MESSAGE:
+                raise McpError(f"the server's answer is longer than {MAX_MESSAGE >> 20} MB")
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -326,7 +364,7 @@ class HttpTransport:
                     m = json.loads("\n".join(data))
                 except ValueError:
                     m = None
-                data = []
+                data, size = [], 0
                 for x in m if isinstance(m, list) else [m]:
                     if isinstance(x, dict) and x.get("id") == rid and "method" not in x:
                         return x
@@ -345,6 +383,7 @@ class HttpTransport:
         try:
             return _wait(slot, timeout, cancel, method)
         except (McpTimeout, McpCancelled) as e:
+            slot.done.set()                              # tells _from_events to stop reading the stream
             threading.Thread(target=self._quiet_notify, args=("notifications/cancelled",
                                                               {"requestId": rid, "reason": str(e)}), daemon=True).start()
             raise
@@ -383,6 +422,7 @@ class McpServer:
         self.transport = None
         self.lock = threading.Lock()
         self.last_start = 0.0
+        self.start_failed = False        # the last start (or restart) failed: tried again at most every 10 s
 
     def start(self) -> bool:
         with self.lock:
@@ -391,6 +431,7 @@ class McpServer:
     def _start(self) -> bool:
         if self.transport is not None:
             self.transport.close()
+        was_ready = self.status in ("ready", "stopped")  # it ran once: this is a restart
         self.status, self.error, self.last_start = "starting", None, time.monotonic()
         t = HttpTransport(self.name, self.cfg) if self.kind == "http" else StdioTransport(self.name, self.cfg)
         self.transport = t
@@ -416,16 +457,26 @@ class McpServer:
                 cursor = page.get("nextCursor")
                 if not cursor:
                     break
-            self.tools, self.status = tools, "ready"
+            self.tools, self.status, self.start_failed = tools, "ready", False
             names = ", ".join(x["name"] for x in tools[:8]) + (", ..." if len(tools) > 8 else "")
             print(f"[strata] MCP server {self.name!r}: {len(tools)} tool{'s' * (len(tools) != 1)}"
                   f"{' (' + names + ')' if tools else ''}", flush=True)
             return True
         except McpError as e:
-            self.status, self.error, self.tools = "failed", str(e), []
+            self.error, self.start_failed = str(e), True
+            if self.kind == "http":
+                t.broken = e                             # so alive() is false and the next call takes the restart path
             t.close()
-            print(f"[strata] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat works "
-                  "without them.", flush=True)
+            if was_ready:
+                # A restart that failed keeps the old tool list and the "stopped" state: the tools stay on offer
+                # and the next call (after the backoff) tries again.  Marking it "failed" would drop its tools
+                # from routes() for the rest of the process, with nothing left to trigger another attempt.
+                self.status = "stopped"
+                print(f"[strata] MCP server {self.name!r} could not be started again: {e}", flush=True)
+            else:
+                self.status, self.tools = "failed", []
+                print(f"[strata] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat "
+                      "works without them.", flush=True)
             return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
@@ -433,7 +484,7 @@ class McpServer:
             if self.transport is None or not self.transport.alive():
                 # it stopped since its last call (a crash, an expired session): start it again; one that failed to
                 # start is tried again at most every 10 s, so a broken command does not run on every call
-                if self.status == "failed" and time.monotonic() - self.last_start < 10:
+                if self.start_failed and time.monotonic() - self.last_start < 10:
                     raise McpError(f"the server is not running ({self.error or 'it stopped'})")
                 print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
                 if not self._start():
