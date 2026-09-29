@@ -25,6 +25,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -394,6 +395,83 @@ class StrataEngine:
             self.proc.kill()
 
 
+# ------------------------------------------------------------------------------------------------ image URLs
+# An image URL is fetched by this server, so it must not reach the link-local range, where cloud metadata services
+# answer (169.254.169.254).  Checking the first URL's name is not enough: urllib follows redirects on its own, and a
+# name can resolve to a public address for the check and to a link-local one for the connection (DNS rebinding).
+# So every redirect's target is checked too, and so is the address actually connected to.
+
+def _link_local(addr: str) -> bool:
+    """169.254/16 or fe80::/10, also inside an IPv4-mapped IPv6 address (older Pythons miss that form)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_link_local
+
+
+def _check_host(host: str) -> None:
+    """ValueError for a host that is unknown or resolves to a link-local address."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError) as e:
+        raise ValueError(f"the image URL's host is unknown ({e})") from None
+    if any(_link_local(info[4][0]) for info in infos):
+        raise ValueError("the image URL points at a link-local address")
+
+
+class _PeerChecked:
+    """connect() refuses a link-local peer, before any request is sent on the connection."""
+
+    def connect(self):
+        super().connect()
+        if _link_local(self.sock.getpeername()[0]):
+            self.sock.close()
+            raise ValueError("the image URL points at a link-local address")
+
+
+class _CheckedHTTPConnection(_PeerChecked, http.client.HTTPConnection):
+    pass
+
+
+class _CheckedHTTPSConnection(_PeerChecked, http.client.HTTPSConnection):
+    pass
+
+
+class _CheckedHTTPHandler(urllib.request.HTTPHandler):
+    def do_open(self, http_class, req, **kw):
+        return super().do_open(_CheckedHTTPConnection, req, **kw)
+
+
+class _CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    def do_open(self, http_class, req, **kw):
+        return super().do_open(_CheckedHTTPSConnection, req, **kw)
+
+
+class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect goes only to http(s) (urllib alone would follow one to ftp:) and its host is checked like the
+    first URL's."""
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        try:
+            if target.scheme not in ("http", "https"):
+                raise ValueError(f"the image URL redirects to a non-http(s) URL ({target.scheme}:)")
+            _check_host(target.hostname or "")
+        except ValueError:
+            fp.close()
+            raise
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _image_opener() -> urllib.request.OpenerDirector:
+    """urllib's opener with the checked connections and redirects (the proxy settings are read as urlopen does)."""
+    return urllib.request.build_opener(_CheckedHTTPHandler, _CheckedHTTPSHandler, _CheckedRedirects)
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -446,15 +524,10 @@ class Vision:
             return data
         if source.startswith(("http://", "https://")):
             host = urllib.parse.urlsplit(source).hostname or ""
-            try:                                        # never the link-local range (cloud metadata services)
-                for info in socket.getaddrinfo(host, None):
-                    if ipaddress.ip_address(info[4][0]).is_link_local:
-                        raise ValueError("the image URL points at a link-local address")
-            except socket.gaierror as e:
-                raise ValueError(f"the image URL's host is unknown ({e})") from None
+            _check_host(host)                           # never the link-local range (see _link_local's block)
             req = urllib.request.Request(source, headers={"User-Agent": "strata"})
             try:
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with _image_opener().open(req, timeout=30) as r:
                     data = r.read(cls.MAX_BYTES + 1)
             except OSError as e:                        # URLError, HTTPError, timeouts
                 raise ValueError(f"the image could not be fetched from {host} ({e})") from None
@@ -560,8 +633,9 @@ def check_gpu(cfg: dict) -> None:
     """A config written on a PC with several GPUs pins the engine to one of them ("gpu": N).  After that card was
     removed, or the PC was rebuilt around one GPU, N may not exist any more: CUDA_VISIBLE_DEVICES=N then hides every
     card and the engine fails to start.  The pin is dropped (the one card, or the driver's first, is used) and
-    the config is corrected, so the next start does not warn again."""
-    if cfg.get("gpu") is None:
+    the config is corrected, so the next start does not warn again.  A list ("gpu": [0, 2], upstream's layer split
+    across cards since engine 0.1.21) is a choice of several cards, not a pin: it is left as it is."""
+    if cfg.get("gpu") is None or isinstance(cfg["gpu"], list):
         return
     have = nvidia_gpu_indices()
     if have is None or not have or cfg["gpu"] in have:

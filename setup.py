@@ -1052,7 +1052,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
     # (a config from before the sampling defaults and "fit_max_tokens" is left as it is: those change what API
     # clients get, so an existing install keeps its behaviour until --setup writes a new config)
-    if cfg.get("gpu") is not None:                     # pinned to a card this PC no longer has (a rebuild around one GPU)
+    # pinned to a card this PC no longer has (a rebuild around one GPU); a list is a layer split's cards, not a pin
+    if cfg.get("gpu") is not None and not isinstance(cfg["gpu"], list):
         found = gpus()
         if found and cfg["gpu"] not in [g["index"] for g in found]:
             warn(f"the config names GPU {cfg['gpu']}, which this PC does not have: using GPU {found[0]['index']}")

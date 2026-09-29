@@ -11,6 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
@@ -618,6 +619,93 @@ class GpuPin(unittest.TestCase):
             finally:
                 S.nvidia_gpu_indices = old
             self.assertEqual(cfg["gpu"], 0)
+
+    def test_a_layer_split_list_is_left_alone(self):
+        from serve import server as S
+        cfg = {"gpu": [0, 2], "args": []}                 # upstream's layer split: several cards, not a stale pin
+        with mock.patch.object(S, "nvidia_gpu_indices", lambda: [0, 1]):
+            S.check_gpu(cfg)
+        self.assertEqual(cfg["gpu"], [0, 2])
+
+
+def _no_proxies():
+    """The image fetches below go straight to the test server, whatever proxy the machine has."""
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    env["no_proxy"] = "*"
+    return mock.patch.dict(os.environ, env, clear=True)
+
+
+class ImageUrlGuard(unittest.TestCase):
+    """What an image URL the server fetches may reach: never the link-local range, by a redirect or a rebound name."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+        hits = cls.hits = []
+        routes = {"/meta": "http://169.254.169.254/latest/meta-data/", "/ftp": "ftp://example.com/x.png",
+                  "/local": "/img"}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path in routes:
+                    self.send_response(302)
+                    self.send_header("Location", routes[self.path])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"image")
+
+            def log_message(self, *args):
+                pass
+
+        cls.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def load(self, path):
+        from serve.server import Vision
+        with _no_proxies():
+            return Vision.load(self.base + path)
+
+    def test_a_url_and_a_redirect_on_the_same_host_load(self):
+        self.assertEqual(self.load("/img"), b"image")
+        self.assertEqual(self.load("/local"), b"image")
+
+    def test_a_redirect_to_link_local_is_refused_before_connecting(self):
+        with self.assertRaisesRegex(ValueError, "link-local"):
+            self.load("/meta")
+
+    def test_a_redirect_off_http_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "ftp"):
+            self.load("/ftp")
+
+    def test_a_rebound_name_is_refused_at_connect(self):
+        # the name passed the check with a public address and resolves to a link-local one for the connection:
+        # the address connected to is checked, before a request is sent.  (The test server stands in for it.)
+        from serve import server as S
+        n = len(self.hits)
+        with mock.patch.object(S, "_check_host", lambda host: None), \
+                mock.patch.object(S, "_link_local", lambda addr: addr == "127.0.0.1"):
+            with self.assertRaisesRegex(ValueError, "link-local"):
+                self.load("/img")
+        self.assertEqual(len(self.hits), n)
+
+    def test_link_local_forms(self):
+        from serve.server import _link_local
+        for addr in ("169.254.169.254", "::ffff:169.254.169.254", "fe80::1", "fe80::1%eth0"):
+            self.assertTrue(_link_local(addr), addr)
+        for addr in ("127.0.0.1", "10.0.0.1", "8.8.8.8", "::1", "not an address"):
+            self.assertFalse(_link_local(addr), addr)
 
 
 if __name__ == "__main__":
