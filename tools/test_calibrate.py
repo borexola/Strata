@@ -21,10 +21,11 @@ import calibrate as CAL  # noqa: E402
 class FakeEngine:
     """Speed = f(pcie_frac, spec_min_p, workers): the GEN line's tune keys arrive as `strata_tune`."""
 
-    def __init__(self, args, speed, info_workers=6, starts=None):
+    def __init__(self, args, speed, info_workers=6, starts=None, spec_gain=None):
         self.args = list(args)
         w = CAL.arg_value(args, "--pool-workers")
         self.workers = int(w) if w else info_workers
+        self.spec_gain = (spec_gain or {}).get(int(CAL.arg_value(args, "--spec") or 4), 1.0)
         self.info = {"pool_workers": info_workers, "pcie_frac": 0.55, "spec_min_p": float(CAL.arg_value(args, "--spec-min-p") or 0)}
         self.speed = speed
         self.last = {}
@@ -34,7 +35,7 @@ class FakeEngine:
 
     def generate(self, ids, max_new, sampling, cancel):
         tune = sampling.get("strata_tune") or {}
-        rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
+        rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers) * self.spec_gain
         for _ in range(max_new):
             yield 1
         self.last = {"generated": max_new, "decode_ms": max_new / rate * 1000.0}
@@ -44,9 +45,10 @@ BASE = ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "8
 
 
 class Calibrate(unittest.TestCase):
-    def run_with(self, speed, workers=6, base=BASE):
+    def run_with(self, speed, workers=6, base=BASE, spec_gain=None):
         starts = []
-        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, speed, workers, starts), say=lambda *_: None)
+        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, speed, workers, starts, spec_gain),
+                          say=lambda *_: None)
         return res, starts
 
     def test_defaults_kept_when_flat(self):
@@ -70,8 +72,16 @@ class Calibrate(unittest.TestCase):
         # a hybrid CPU: half the workers is 20% faster
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)))   # one start per worker count, plus the sweep
+        # one start per worker count and per draft depth, plus the sweep
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.SPECS))
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
+
+    def test_deeper_drafts_when_they_pay(self):
+        res, starts = self.run_with(lambda f, p, w: 50.0, spec_gain={6: 1.1})
+        self.assertEqual(res["settings"].get("--spec"), "6")
+        self.assertEqual(CAL.arg_value(starts[0], "--spec"), "4")               # measured against the product default
+        res, _ = self.run_with(lambda f, p, w: 50.0, spec_gain={5: 1.02, 6: 1.02})   # within the noise: the default stays
+        self.assertNotIn("--spec", res["settings"])
 
     def test_old_calibration_is_the_baseline_reset(self):
         # a config tuned earlier: the measurement starts from the product defaults, not from those values

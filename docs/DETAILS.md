@@ -51,7 +51,10 @@ for the original model, not for Swift 1.5.
 attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Q2_0 at 262K: 50.9 -> 62.6 tokens/s
 (1,589 -> 3,872 experts in VRAM); at 128K about +6%. The attention reads exactly the same values (only where the KV lives changes); it
 costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
-it on.
+it on. On a card with 24 GB or more the trade can go the other way: with 10,000+ experts resident the hit rate is
+already 94-96% and the freed VRAM buys nothing measurable, while the positions past the resident window are fetched
+from RAM per token at long contexts. To compare on such a card, remove `"--kv-resident", "32768"` from the `args` in
+`strata-<model>.json` and measure a 60K+ conversation both ways (the `done:` line's tok/s).
 
 **4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
 halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
@@ -212,7 +215,9 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
   (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less);
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
-- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
+- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster);
+- how many guesses the draft layer makes per check (`--spec`, 4 by default; 5 and 6 are tried): a big card at a
+  high hit rate finishes a check in about the same time whatever its width, so more guesses per check pay there.
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
 install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output

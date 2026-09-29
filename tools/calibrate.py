@@ -8,8 +8,11 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   per extra window row (more experts per window), so it wants a higher floor.
   --pool-workers  the CPU threads that compute experts.  Every physical core is not always best: on hybrid CPUs the
                   efficiency cores can make the whole window wait for them.
-The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
-per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
+  --spec          how many guesses the draft layer makes per check (setup's 4).  A card that finishes a check in
+                  about the same time whatever its width (a big one at a high hit rate) gains from more guesses;
+                  a slower one pays for the extra rows.
+The first two are measured through one engine (per-request `strata_tune` keys); the worker count and the draft
+depth need a restart per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
@@ -33,6 +36,7 @@ MIN_GAIN = 0.03                    # a setting must beat the default by this muc
 SWEEP_PASSES = 2                   # each sweep setting is measured this many times, the settings interleaved
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+SPECS = (5, 6)                     # draft depths tried beyond setup's --spec 4 (the engine caps the window at 8)
 MAX_NEW = 128
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
@@ -206,6 +210,38 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, sampling: d
             base_rate = statistics.median(by_workers[w_best])
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
+    # 5. the draft depth, with everything chosen so far (a restart each).  The default's figure is the worker
+    # step's when that ran (the same procedure), else measured here.
+    d_spec = int(arg_value(base_args, "--spec") or DEFAULTS["--spec"])
+    tuned = with_arg(with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}"),
+                     "--pool-workers", settings.get("--pool-workers"))
+
+    def restart_rate(args, label) -> list:
+        say(f"  Measuring with {label} (restarts the engine) ...")
+        e = start_engine(args)
+        try:
+            se = Session(e, ids_list, sampling)
+            se.warm_up(1)
+            return [se.rate(), se.rate()]
+        finally:
+            close(e)
+
+    by_spec = {}
+    for sp in (d_spec, *SPECS):
+        if sp in by_spec or sp < d_spec:
+            continue
+        if sp == d_spec and base_rate is not None and d_workers:
+            by_spec[sp] = [base_rate]                   # the worker step measured the default depth already
+            continue
+        by_spec[sp] = restart_rate(with_arg(tuned, "--spec", str(sp)), f"{sp} draft guesses per check")
+        say(f"    --spec {sp}: {statistics.median(by_spec[sp]):.1f} tok/s")
+    s_best = pick(by_spec, d_spec)
+    report["spec"] = {str(k): v for k, v in by_spec.items()}
+    if s_best != d_spec:
+        settings["--spec"] = str(s_best)
+        base_rate = statistics.median(by_spec[s_best])
+    elif by_spec.get(d_spec):
+        base_rate = statistics.median(by_spec[d_spec])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "report": report}
@@ -224,7 +260,7 @@ def close(eng):
         proc.kill()
 
 
-DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None}   # None: the engine's own choice
+DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None, "--spec": "4"}   # None: the engine's own choice
 
 
 def apply(args: list[str], settings: dict) -> list[str]:

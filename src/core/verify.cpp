@@ -663,6 +663,8 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    size_t n_nodes = 0;
+    if (cudaGraphGetNodes(graph, nullptr, &n_nodes) != cudaSuccess) n_nodes = 0;
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
@@ -671,8 +673,10 @@ bool Verifier::capture(int T, std::string& err) {
     }
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    // the node count is the window's fixed launch cost: a card that finishes each node's work quickly (a big one at
+    // a high hit rate) is paced by it, and then a wider window (--spec) is nearly free per extra token
+    std::fprintf(stderr, "strata verify: captured the %d-token window (%zu graph nodes; upload %s, sync %s)\n", T,
+                 n_nodes, cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
 
