@@ -82,14 +82,17 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
 class Session:
     """One running engine: measure decode tok/s for a setting (the median of the prompts' rates)."""
 
-    def __init__(self, engine, ids_list):
+    def __init__(self, engine, ids_list, sampling: dict | None = None):
         self.engine = engine
         self.ids_list = ids_list
+        # the config's own sampling block when it has one: a setting tuned for greedy decoding (every draft the
+        # model agrees with is taken) is not the one for sampled decoding, where fewer drafts survive
+        self.sampling = {**sampling, "seed": 1} if sampling else {"temperature": 0}
 
     def rate(self, tune: dict | None = None) -> float:
         rates = []
         for ids in self.ids_list:
-            sampling = {"temperature": 0}
+            sampling = dict(self.sampling)
             if tune:
                 sampling["strata_tune"] = tune
             n = sum(1 for t in self.engine.generate(ids, MAX_NEW, sampling, threading.Event()) if t is not None)
@@ -120,10 +123,13 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(cfg["args"], ids_list, start_engine, say)
+    sampling = {k: v for k, v in (cfg.get("sampling") or {}).items() if k in ("temperature", "top_p", "top_k", "min_p")}
+    if sampling:
+        say("  Measured with the config's sampling (" + ", ".join(f"{k} {v}" for k, v in sampling.items()) + ")")
+    return measure(cfg["args"], ids_list, start_engine, say, sampling or None)
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, sampling: dict | None = None) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -134,7 +140,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         d_pcie = float(info.get("pcie_frac", 0.55))
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
-        s = Session(eng, ids_list)
+        s = Session(eng, ids_list, sampling)
         s.warm_up(3)
         # The speed drifts over a session by more than the settings differ (the adaptive expert tier keeps moving
         # experts, the card's clocks and the OS wander), so a sweep is never one measurement per setting in a
@@ -187,7 +193,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
             e = start_engine(with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)))
             try:
-                sw = Session(e, ids_list)
+                sw = Session(e, ids_list, sampling)
                 sw.warm_up(1)
                 by_workers[w] = [sw.rate(), sw.rate()]
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")

@@ -4,8 +4,6 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
 
-#include "strata/kernels/elementwise.hpp"   // device_sm_count: the stagers' grids scale with the card
-
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -309,7 +307,10 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<(unsigned) (device_sm_count() * 8), 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    // 384 blocks, on every card: the stager's threads wait on PCIe reads and run BESIDE the compute kernels, so
+    // a grid sized by the SM count (8 blocks on each of a 5090's 170 SMs) took every SM slot from them - decode
+    // fell from ~140 to ~85 tok/s on that card.  The fixed grid leaves most of a big card to the compute.
+    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
@@ -339,7 +340,7 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
-    const unsigned blocks = (unsigned) (device_sm_count() * 8);   // 48 * 8 on the card it was tuned on
+    const unsigned blocks = 48 * 8;   // fixed, as in fetch_blobs: it overlaps the compute kernels
     if (row_bytes % 16 == 0)
         gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
     else if (row_bytes % 4 == 0)

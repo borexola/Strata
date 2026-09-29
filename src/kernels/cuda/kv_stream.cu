@@ -1,5 +1,4 @@
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
-#include "strata/kernels/elementwise.hpp"   // device_sm_count
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -214,7 +213,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<(unsigned) (device_sm_count() * 2), 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));   // fixed: it runs beside the compute
     check("copy");
 }
 

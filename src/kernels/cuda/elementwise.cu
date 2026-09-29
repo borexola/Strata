@@ -36,20 +36,6 @@ __global__ void embedding_gather_kernel(const uint8_t* __restrict__ codes,
 /// relative precision; above 20 the function is `x` to within f32 anyway.
 __device__ __forceinline__ float softplus_dev(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
-}  // namespace
-
-int device_sm_count() {
-    static int sms = 0;
-    if (sms <= 0) {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0)
-            sms = 48;
-    }
-    return sms;
-}
-
-namespace {
 __global__ void gdn_gate_kernel(const float* __restrict__ alpha, const float* __restrict__ dt,
                                 const float* __restrict__ ssm_a, float* __restrict__ gate, int64_t n, int64_t h_v) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
