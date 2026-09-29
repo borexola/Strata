@@ -954,8 +954,12 @@ void doorbell_reset(const Doorbell& db) {
 bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev,
                void* stream, std::string& err) {
     if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table (IQ model files)
-        if (token < 0 || out_dev == nullptr) { err = "embed_row: invalid token or output"; return false; }
-        ne->gather_one(token, out_dev, stream);
+        if (out_dev == nullptr) { err = "embed_row: invalid output"; return false; }
+        if (token < 0 || token >= ne->n_vocab()) {
+            err = "embed_row: token " + std::to_string(token) + " is outside 0.." + std::to_string(ne->n_vocab() - 1);
+            return false;
+        }
+        if (!ne->gather_one(token, out_dev, stream)) { err = "embed_row: the native embedding refused the row"; return false; }
         return true;
     }
     const WeightRef* w = tables.find(EMBEDDING_NAME);

@@ -81,7 +81,8 @@ std::vector<int> physical_cores(bool skip_first);
 /// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
 /// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
 ///
-/// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
+/// Returns a token for the PREVIOUS affinity (kept in full, on this thread), or -1 if the platform refused;
+/// pass it to `restore_thread_affinity` from the same thread.
 long long pin_current_thread(int core);
 void restore_thread_affinity(long long previous);
 

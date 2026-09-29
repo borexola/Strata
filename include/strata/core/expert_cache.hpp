@@ -113,6 +113,8 @@ public:
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;
+    /// Bytes `slot` may hold (its own span when the slots are sized), or 0 for a slot outside the arena.
+    int64_t slot_capacity(int32_t slot) const;
 
     /// Copies `(layer, expert)`'s blob from `host_blob` into `slot` on `stream`.  Asynchronous: the caller
     /// orders it.  Returns false if the indices are out of range rather than reading past the arena.

@@ -360,6 +360,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
+        if (d.plan != nullptr) {
+            // A window the plan cannot take: nothing is published, so the GPU would compute nothing for the
+            // resident entries this loop marks as its - they would contribute zero and the token would still be
+            // finite.  Refuse instead.
+            d.failed = true;
+            d.fail = "a verify window routes more entries than the GPU plan can take";
+            d.fail_layer = d.layers;
+            return;
+        }
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&

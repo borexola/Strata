@@ -43,6 +43,18 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
+    // Both counts size allocations below; a pair count above the number of (layer, expert) pairs that exist
+    // cannot be a valid profile, whatever the file goes on to say.
+    const uint64_t n_pairs = (uint64_t) n_layers * (uint64_t) n_expert;
+    if ((uint64_t) want > n_pairs || (uint64_t) n_ranked > n_pairs) {
+        std::fclose(f);
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "read_expert_profile: %s claims %u slots and %u ranked pairs but the model has only %llu experts",
+                      path.c_str(), want, n_ranked, (unsigned long long) n_pairs);
+        err = buf;
+        return false;
+    }
     ranked.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
     if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {
@@ -154,7 +166,14 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
-    layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    // `open` set the per-layer cursors for `off.back()` one-byte slots; the ranges are a function of `slots_`,
+    // so they are rebuilt now that the real slot count is in.  Left at zero, every layer's first `admit` would
+    // hand out slot 0, 1, 2... and the layers would overwrite each other's blobs.
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 
@@ -223,14 +242,29 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+/// Bytes one slot may hold: its own span when the slots are sized, else the uniform blob.  The largest blob is
+/// NOT the right bound for a sized slot - a small layer's slot filled with a large layer's blob would run into
+/// the next slot.
+int64_t ExpertCache::slot_capacity(int32_t slot) const {
+    if (slot < 0 || slot >= slots_) return 0;
+    if (!off_.empty()) return (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]);
+    return blob_;
+}
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
               std::to_string(slots_ - 1);
         return false;
     }
+    const int64_t cap = slot_capacity(slot);
+    if (bytes > cap) {
+        err = "ExpertCache::fill_slot: a " + std::to_string(bytes) + " B blob does not fit slot " +
+              std::to_string(slot) + " (" + std::to_string(cap) + " B)";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 ? bytes : cap);
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
@@ -246,12 +280,18 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
         return false;
     }
+    const int64_t cap = slot_capacity(slot);
+    if (bytes > cap) {
+        err = "ExpertCache::fill_slot_blocking: a " + std::to_string(bytes) + " B blob does not fit slot " +
+              std::to_string(slot) + " (" + std::to_string(cap) + " B)";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 ? bytes : cap);
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
@@ -266,12 +306,22 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
         return false;
     }
+    if (host_blob == nullptr) {
+        err = "ExpertCache::verify_slot: the host blob is null";
+        return false;
+    }
+    const int64_t cap = slot_capacity(slot);
+    if (bytes > cap) {
+        err = "ExpertCache::verify_slot: a " + std::to_string(bytes) + " B blob does not fit slot " +
+              std::to_string(slot) + " (" + std::to_string(cap) + " B)";
+        return false;
+    }
+    const int64_t nb = bytes > 0 ? bytes : cap;
     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
@@ -287,7 +337,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
-                      (int) slot, (unsigned long long) first, (long long) blob_);
+                      (int) slot, (unsigned long long) first, (long long) nb);
         err = buf;
         return false;
     }

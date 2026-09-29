@@ -118,6 +118,12 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
+        // The directory's offset is a claim about the file; the memcpy below reads `bytes_` past it.
+        const uint64_t payload = gguf.file_size() - gguf.data_start();
+        if (t->offset > payload || bytes_ > payload - t->offset) {
+            err = "native embedding: truncated token_embd.weight payload";
+            return false;
+        }
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
@@ -144,8 +150,10 @@ void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, v
     strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
 }
 
-void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
+bool NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
+    if (token < 0 || token >= n_vocab_ || dev_ == nullptr) return false;
     strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    return true;
 }
 
 }  // namespace strata::core

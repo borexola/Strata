@@ -90,12 +90,16 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
 #endif
 }
 
-void release(void* p, uint64_t bytes) {
+void release(void* p, uint64_t bytes, PageBacking backing) {
     if (!p) return;
 #ifdef _WIN32
     (void) bytes;
+    (void) backing;
     VirtualFree(p, 0, MEM_RELEASE);
 #else
+    // A hugetlb mapping is rounded up to whole 2 MB pages by the kernel, and munmap of one must name the
+    // rounded length: the unrounded figure is EINVAL and the arena would stay mapped for the life of the process.
+    if (backing == PageBacking::LargePages) bytes = (bytes + (2u << 20) - 1) / (2u << 20) * (2u << 20);
     munmap(p, bytes);
 #endif
 }
@@ -204,7 +208,7 @@ PinnedArena::~PinnedArena() {
         } else {
             cudaHostUnregister(base);
         }
-        release(base, capacity);
+        release(base, capacity, backing);
         base = nullptr;
     }
 }

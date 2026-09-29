@@ -95,49 +95,51 @@ std::vector<int> physical_cores(bool skip_first) {
 
 namespace {
 
-void pin_this_thread(int core) {
-    if (core < 0) return;
+// A core number is `physical_cores`' encoding: on Windows `Group * 64 + bit`, so a machine with more than 64
+// logical processors needs the GROUP form of the call - the plain mask would pin to the same bit of whatever
+// group the thread happens to be in.  Returns false when the OS refused; `prev`, when given, receives the
+// thread's affinity before the change.
 #if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
+bool pin_this_thread(int core, GROUP_AFFINITY* prev = nullptr) {
+    if (core < 0) return false;
+    GROUP_AFFINITY ga{};
+    ga.Group = (WORD) (core / 64);
+    ga.Mask = (KAFFINITY) 1 << (core % 64);
+    return SetThreadGroupAffinity(GetCurrentThread(), &ga, prev) != 0;
+}
 #else
+bool pin_this_thread(int core, cpu_set_t* prev = nullptr) {
+    if (core < 0 || core >= CPU_SETSIZE) return false;
+    if (prev != nullptr && pthread_getaffinity_np(pthread_self(), sizeof *prev, prev) != 0) return false;
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
-    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-#endif
+    return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
 }
+#endif
+
+// The host loop's affinity before `pin_current_thread`, kept whole: a processor group or a CPU above 63 does
+// not fit the 64-bit value the API hands back, so that value is a token and this is the state it names.
+#if defined(_WIN32)
+thread_local GROUP_AFFINITY g_prev_affinity{};
+#else
+thread_local cpu_set_t g_prev_affinity;
+#endif
 
 }  // namespace
 
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
-#if defined(_WIN32)
-    // `SetThreadAffinityMask` RETURNS the previous mask, or 0 on failure - so 0 doubles as the error, which is
-    // why the caller must not treat it as a restorable value.
-    const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
-    return prev == 0 ? -1 : (long long) prev;
-#else
-    cpu_set_t prev;
-    CPU_ZERO(&prev);
-    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
-    unsigned long mask = 0;
-    for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
-        if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
-    pin_this_thread(core);
-    return (long long) mask;
-#endif
+    if (!pin_this_thread(core, &g_prev_affinity)) return -1;
+    return 1;
 }
 
 void restore_thread_affinity(long long previous) {
     if (previous <= 0) return;
 #if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
+    SetThreadGroupAffinity(GetCurrentThread(), &g_prev_affinity, nullptr);
 #else
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    for (int i = 0; i < 64; ++i)
-        if ((previous >> i) & 1) CPU_SET(i, &set);
-    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof g_prev_affinity, &g_prev_affinity);
 #endif
 }
 

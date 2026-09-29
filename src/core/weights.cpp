@@ -183,6 +183,21 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         err = "arena is " + std::to_string(arena_bytes) + " B but the index needs " + std::to_string(pool);
         return false;
     }
+    // The rows are what the pack's own tool wrote, but `dst_off` is where the arena gets WRITTEN and `ne0`/`ne1`
+    // are what every kernel sizes its reads by: a row that names bytes outside the arena, or a shape with no
+    // elements, is refused here rather than trusted because the header's `pool` figure happened to fit.
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const IndexRow& r = rows[i];
+        if (r.ne0 <= 0 || r.ne1 < 0) {
+            err = r.name + ": index.txt gives it the shape " + std::to_string(r.ne0) + " x " + std::to_string(r.ne1);
+            return false;
+        }
+        if (!skipped[i] && (r.dst_off > arena_bytes || r.dst_bytes > arena_bytes - r.dst_off)) {
+            err = r.name + ": index.txt places it at " + std::to_string(r.dst_off) + " + " +
+                  std::to_string(r.dst_bytes) + " B, outside the " + std::to_string(arena_bytes) + " B arena";
+            return false;
+        }
+    }
 
     // Two pinned staging buffers, both reused.  Pinned because a 5 GB pageable upload spends its time in the
     // driver copying through a bounce buffer, and bounded by CHUNK rather than by the largest tensor.

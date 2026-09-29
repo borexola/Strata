@@ -196,6 +196,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             }
             if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
                 err = "session_capture: begin failed at layer " + std::to_string(l);
+                cudaStreamDestroy(cs);
                 return false;
             }
             err.clear();
@@ -206,23 +207,30 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                                 : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                                   s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
-            if (!ok) {
-                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
-                return false;
-            }
+            // The capture is closed on EVERY path out of here.  Left open on a leaked stream, the next runtime
+            // call fails with "operation not permitted when stream is capturing" and the layer's own error is
+            // what gets hidden.
             cudaGraph_t graph = nullptr;
             const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
             cudaStreamDestroy(cs);
+            if (!ok) {
+                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
+                if (graph) cudaGraphDestroy(graph);
+                return false;
+            }
             if (ce != cudaSuccess) {
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " +
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
+                if (graph) cudaGraphDestroy(graph);
                 return false;
             }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
-                err = "session_capture: instantiate failed at layer " + std::to_string(l);
-                return false;
-            }
+            const cudaError_t ie = cudaGraphInstantiate(out, graph, 0);
             cudaGraphDestroy(graph);
+            if (ie != cudaSuccess) {
+                err = "session_capture: instantiate failed at layer " + std::to_string(l) + ": " +
+                      cudaGetErrorString(ie);
+                return false;
+            }
             return true;
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
@@ -599,7 +607,13 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 
     // the first layer has no previous layer's experts: `y_miss` starts at zero, which is what "hits are empty
     // in this phase" means once every miss has been computed
-    cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+    {
+        const cudaError_t me = cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+        if (me != cudaSuccess) {
+            err = std::string("session_loop: the initial parts copy: ") + cudaGetErrorString(me);
+            return false;
+        }
+    }
     doorbell_reset(*s.db);
     uint32_t expected = 0;
 
@@ -688,7 +702,13 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // `sum_j w_{l+1}[j] * expert_{ids_l,j}(x_l)` - both the selection and the input one layer stale while
         // the weights were current.  It produced finite, fluent, deterministic tokens that were not the
         // model's, and no timing test could see it.
-        cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+        {
+            const cudaError_t me = cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+            if (me != cudaSuccess) {
+                err = "session_loop: parts copy at layer " + std::to_string(l) + ": " + cudaGetErrorString(me);
+                return false;
+            }
+        }
         // ---- **AND THEN THE COMBINE.**  Stream-ordered after the copy above, so `hit_out` is added to misses
         // that are already in `parts`, and before `post[l]`, whose `moe_combine` reads the sum.  A no-op when
         // there is no VRAM tier or nothing is resident, which is every layer until the cache warms.
