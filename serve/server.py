@@ -135,6 +135,15 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
+                elif "expert cache auto:" in line:
+                    say("auto", "[strata] " + line.split("strata generate: ", 1)[-1].strip())
+                elif "trying a smaller expert cache" in line or "shrinking the expert cache" in line:
+                    # the reasons a card ends up with fewer experts than it has room for - the log had them, the
+                    # window did not: the one big allocation refused (on Windows it is charged to the commit,
+                    # RAM + page file), or the reserve short once the slots were written
+                    say("shrink" + str(len(said)), "[strata] " + line.split("strata generate: ", 1)[-1].strip() +
+                        ("\n         (Windows: the graphics card's memory needs room in the page file too - set it to "
+                         "\"System managed\"; and close programs that use a lot of RAM)" if os.name == "nt" else ""))
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
