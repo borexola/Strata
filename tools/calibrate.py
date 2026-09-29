@@ -177,7 +177,10 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, sampling: d
             for k, name in ((dflt, "the defaults"), (cand, "the candidate")):
                 say(f"    {name} (PCIe share {k[0]:.2f}, draft floor {k[1]:.2f}): {statistics.median(confirm[k]):.1f} tok/s  "
                     f"({', '.join(f'{r:.1f}' for r in confirm[k])})")
-        chosen = pick(confirm, dflt) if cand != dflt else dflt
+        # the candidate must also win most of its interleaved pairs: a median 3% ahead on three pairs of which it
+        # lost two is one lucky measurement, not a setting
+        wins = sum(c > d for c, d in zip(confirm[cand], confirm[dflt])) if cand != dflt else 0
+        chosen = pick(confirm, dflt) if cand != dflt and wins * 2 > len(confirm[dflt]) else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
