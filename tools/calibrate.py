@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
+SWEEP_PASSES = 2                   # each sweep setting is measured this many times, the settings interleaved
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
 MAX_NEW = 128
@@ -134,26 +135,38 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
-        s.warm_up()
+        s.warm_up(3)
+        # The speed drifts over a session by more than the settings differ (the adaptive expert tier keeps moving
+        # experts, the card's clocks and the OS wander), so a sweep is never one measurement per setting in a
+        # row: every setting is measured SWEEP_PASSES times with the settings interleaved, and the median counts.
+
+        def sweep(keys, tune_of, label):
+            got = {k: [] for k in keys}
+            for _ in range(SWEEP_PASSES):
+                for k in keys:
+                    got[k].append(s.rate(tune_of(k)))
+            for k in keys:
+                say(f"    {label} {k:.2f}: {statistics.median(got[k]):.1f} tok/s  ({', '.join(f'{r:.1f}' for r in got[k])})")
+            return got
+
         # 1. the PCIe share, at the default draft floor
-        by_pcie = {}
-        for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
-            by_pcie[f] = [s.rate({"pcie_frac": f, "spec_min_p": d_minp})]
-            say(f"    PCIe share {f:.2f}: {by_pcie[f][0]:.1f} tok/s")
-        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
+        by_pcie = sweep(sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}),
+                        lambda f: {"pcie_frac": f, "spec_min_p": d_minp}, "PCIe share")
+        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = {}
-        for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate({"pcie_frac": best_pcie, "spec_min_p": p})]
-            say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
-        best_minp = max(by_minp, key=lambda k: by_minp[k][0])
-        # 3. the winner against the default, interleaved, three times each
+        by_minp = sweep(sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}),
+                        lambda p: {"pcie_frac": best_pcie, "spec_min_p": p}, "draft floor")
+        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
+        # 3. the winner against the default, interleaved, three times each - the decision, so it is shown
         dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
         confirm = {dflt: [], cand: []}
         if cand != dflt:
             for _ in range(3):
                 for k in (dflt, cand):
                     confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+            for k, name in ((dflt, "the defaults"), (cand, "the candidate")):
+                say(f"    {name} (PCIe share {k[0]:.2f}, draft floor {k[1]:.2f}): {statistics.median(confirm[k]):.1f} tok/s  "
+                    f"({', '.join(f'{r:.1f}' for r in confirm[k])})")
         chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
