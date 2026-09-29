@@ -2808,15 +2808,6 @@ int main(int argc, char** argv) {
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
-            // the values come from a network client through the server: NaN/inf make the chain pick at random
-            // (inv_t = 0), a zero or negative repeat penalty divides logits by it
-            if (!std::isfinite(req_temperature) || !std::isfinite(req_top_p) || !std::isfinite(req_min_p) ||
-                !std::isfinite(req_penalty_repeat) || !std::isfinite(req_penalty_freq) ||
-                !std::isfinite(req_penalty_present) || req_penalty_repeat <= 0.0f || req_temperature < 0.0f) {
-                std::printf("ERR bad request: a sampling value is not finite or out of range\n");
-                std::fflush(stdout);
-                continue;
-            }
             std::string emb_path;
             if (geni && endp != nullptr) {
                 while (*endp == ' ') ++endp;
@@ -2838,8 +2829,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || max_new > o.max_context || endp == nullptr || (geni && emb_path.empty()) ||
-                !parse_i64_list(endp, ids, pe)) {
+            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }

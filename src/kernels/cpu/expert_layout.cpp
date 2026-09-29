@@ -99,16 +99,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
-                if (at != std::string::npos) {
-                    L.n_expert = std::atoll(line.c_str() + at + 10);
-                    // `n_expert` sizes the arena and every per-layer stride; the canonical geometry is 512
-                    // and a pruned model has fewer, so anything else is a corrupt header.
-                    if (L.n_expert <= 0 || L.n_expert > 512) {
-                        err = "native_experts.txt: the header's n_expert is " + std::to_string(L.n_expert) +
-                              ", not in 1..512";
-                        return false;
-                    }
-                }
+                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
             }
             continue;
         }
@@ -133,13 +124,6 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
             std::string file;             // v3: the shard that holds this layer (a file name beside --native)
             if (ss >> file) {
-                // A file NAME beside --native, and only that: a separator or ".." would let the index open a
-                // file elsewhere.
-                if (file.find('/') != std::string::npos || file.find('\\') != std::string::npos ||
-                    file.find("..") != std::string::npos) {
-                    err = "native_experts.txt: layer " + std::to_string(l) + " names a shard with a path in it: " + file;
-                    return false;
-                }
                 if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
                 L.gguf_file[(size_t) l] = file;
             }

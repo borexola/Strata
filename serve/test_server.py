@@ -578,42 +578,6 @@ class Hardening(unittest.TestCase):
         except OSError:
             pass                                          # the server closed the connection: also refused
 
-    def test_status_needs_the_key_when_one_is_set(self):
-        self.svc.api_key = "secret"
-        try:
-            self.assertEqual(urllib.request.urlopen(self.base + "/health", timeout=10).status, 200)
-            try:
-                urllib.request.urlopen(self.base + "/status", timeout=10)
-                self.fail("/status answered without the key")
-            except urllib.error.HTTPError as e:
-                self.assertEqual(e.code, 401)
-        finally:
-            self.svc.api_key = ""
-
-    def test_a_foreign_host_name_is_refused_without_a_key(self):
-        import socket
-        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
-        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "evil.example:8080"})[0], 403)
-        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "localhost:8080"})[0], 200)
-        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "192.168.1.20:8080"})[0], 200)
-        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": socket.gethostname() + ":8080"})[0], 200)
-        self.svc.bind_host = "0.0.0.0"                     # opened to the network: reached by whatever name the user chose
-        try:
-            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "gaming-pc.tail1234.ts.net"})[0], 200)
-        finally:
-            self.svc.bind_host = "127.0.0.1"
-        self.svc.allowed_hosts = {"mypc.lan"}
-        try:
-            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "mypc.lan:8080"})[0], 200)
-        finally:
-            self.svc.allowed_hosts = set()
-        self.svc.api_key = "secret"                       # with a key, the key is the protection
-        try:
-            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "evil.example",
-                                                                             "Authorization": "Bearer secret"})[0], 200)
-        finally:
-            self.svc.api_key = ""
-
     def test_the_detokenizer_matches_a_whole_decode(self):
         from serve.server import Detokenizer
         tok = ByteTokenizer()

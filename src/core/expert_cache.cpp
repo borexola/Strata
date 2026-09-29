@@ -43,18 +43,6 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
-    // Both counts size allocations below; a pair count above the number of (layer, expert) pairs that exist
-    // cannot be a valid profile, whatever the file goes on to say.
-    const uint64_t n_pairs = (uint64_t) n_layers * (uint64_t) n_expert;
-    if ((uint64_t) want > n_pairs || (uint64_t) n_ranked > n_pairs) {
-        std::fclose(f);
-        char buf[256];
-        std::snprintf(buf, sizeof buf,
-                      "read_expert_profile: %s claims %u slots and %u ranked pairs but the model has only %llu experts",
-                      path.c_str(), want, n_ranked, (unsigned long long) n_pairs);
-        err = buf;
-        return false;
-    }
     ranked.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
     if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {

@@ -435,28 +435,6 @@ private:
         alignment_ = align;
         data_start_ = (c.pos() + align - 1) / align * align;
         if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
-        // `tensor_data` is unchecked pointer arithmetic, so the directory is checked once here: every tensor
-        // whose byte size this reader can compute must lie inside the payload.  A type without a known block
-        // geometry is left to its consumer rather than refused - a valid file must not fail on a type this
-        // table has not learned.
-        const uint64_t payload = size_ - data_start_;
-        for (const auto& t : tensors_) {
-            int block_elems = 0, block_bytes = 0;
-            if (!block_geometry(t.type, block_elems, block_bytes)) continue;
-            if (t.shape[0] % (uint64_t)block_elems != 0) continue;   // not whole blocks: the consumer refuses it
-            uint64_t elements = 1;
-            for (uint64_t d : t.shape) {
-                if (d != 0 && elements > UINT64_MAX / d)
-                    throw std::runtime_error("GGUF: tensor " + t.name + " has an implausible shape");
-                elements *= d;
-            }
-            const uint64_t blocks = elements / (uint64_t)block_elems;
-            if (blocks > UINT64_MAX / (uint64_t)block_bytes)
-                throw std::runtime_error("GGUF: tensor " + t.name + " has an implausible shape");
-            const uint64_t bytes = blocks * (uint64_t)block_bytes;
-            if (t.offset > payload || bytes > payload - t.offset)
-                throw std::runtime_error("GGUF: tensor " + t.name + " extends past the end of the file");
-        }
     }
 
     std::string path_;

@@ -118,12 +118,6 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
-        // The directory's offset is a claim about the file; the memcpy below reads `bytes_` past it.
-        const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (t->offset > payload || bytes_ > payload - t->offset) {
-            err = "native embedding: truncated token_embd.weight payload";
-            return false;
-        }
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";

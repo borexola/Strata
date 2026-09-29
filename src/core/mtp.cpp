@@ -72,7 +72,6 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     const std::streamsize n = f.tellg();
-    if (n < 0) return false;   // tellg reports a failed seek as -1, which resize would take as a huge size
     f.seekg(0);
     out.resize((size_t) n);
     return (bool) f.read((char*) out.data(), n);
@@ -132,15 +131,6 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        // `f32`/`bf16`/`q8` hand `dense_ + off` straight to kernels, so every span is checked against the blob
-        // that was actually read, not against what dense.txt says about itself.
-        for (const Tensor& t : tensors_) {
-            if (t.off > blob.size() || t.bytes > blob.size() - t.off) {
-                err = "mtp: dense.txt places " + t.name + " at " + std::to_string(t.off) + " + " +
-                      std::to_string(t.bytes) + " B, outside the " + std::to_string(blob.size()) + " B dense.bin";
-                return false;
-            }
-        }
         if (cudaMalloc((void**) &dense_, blob.size()) != cudaSuccess) { err = "mtp: dense weights do not fit"; return false; }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();

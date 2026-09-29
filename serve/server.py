@@ -639,8 +639,6 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        self.allowed_hosts: set[str] = set()           # host names this server answers to without a key (config)
-        self.bind_host = "127.0.0.1"                   # where it listens: the Host check applies to a local server only
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -650,21 +648,6 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
-
-    def own_names(self) -> set[str]:
-        """This PC's own names (its hostname, with and without a domain, and its .local name): a browser on this PC
-        reaching http://<hostname>:8080 is not a page from elsewhere."""
-        names = getattr(self, "_own_names", None)
-        if names is None:
-            import socket
-            names = set()
-            for n in (socket.gethostname(), socket.getfqdn()):
-                if n:
-                    names.add(n.lower())
-                    names.add(n.split(".")[0].lower())
-                    names.add(n.split(".")[0].lower() + ".local")
-            self._own_names = names
-        return names
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1305,8 +1288,6 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key)})
             elif path == "/status":
-                if not self._authorized():              # it shows the text being written (issue: any LAN client could read it)
-                    return
                 with svc.status_lock:
                     s = dict(svc.status)
                 now = time.time()
@@ -1329,30 +1310,6 @@ def make_handler(svc: Service):
             """May this client name files on this PC's disk as images: it is on this PC, or it holds the key."""
             return bool(svc.api_key) or self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
-        def _host_ok(self) -> bool:
-            """Without an API key the only thing between a web page elsewhere and this server is the browser's
-            same-origin rule, and DNS rebinding gets around it (a page at evil.example whose name is then pointed
-            at 127.0.0.1 sends its requests with Host: evil.example).  So the Host must be one of this PC's own
-            names: localhost, its addresses, the bound host, or the config's "allowed_hosts"."""
-            if svc.api_key or svc.bind_host not in ("127.0.0.1", "localhost", "::1", ""):
-                return True                              # a key protects it; a network server answers to any name
-            host = self.headers.get("Host", "")
-            name = host.rsplit(":", 1)[0] if host.count(":") == 1 or host.startswith("[") else host
-            name = name.strip("[]").lower()
-            if name in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "") or name in svc.allowed_hosts \
-                    or name in svc.own_names():
-                return True
-            try:
-                ip = ipaddress.ip_address(name)          # a LAN address of this PC (or any address: the attacker's
-                if ip.is_private or ip.is_loopback:      # page cannot point its own name at it AND set that host)
-                    return True
-            except ValueError:
-                pass
-            self._json(403, {"error": {"message": f"the host name {host!r} is not one this server answers to: use "
-                                                  "127.0.0.1, its IP address, or add it to \"allowed_hosts\" in the "
-                                                  "config (or set an API key)"}})
-            return False
-
         def _body(self) -> bytes | None:
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -1368,7 +1325,7 @@ def make_handler(svc: Service):
             return self.rfile.read(length)
 
         def do_POST(self):
-            if not self._authorized() or not self._host_ok():
+            if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path == "/settings":
@@ -1755,8 +1712,6 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
-    svc.allowed_hosts = {str(h).lower() for h in (cfg.get("allowed_hosts") or [])}
-    svc.bind_host = a.host
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

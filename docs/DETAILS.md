@@ -301,9 +301,6 @@ print(r.choices[0].message.content)
   run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
   `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
   (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
-  A server that listens on this PC only, without a key, answers to its own names alone (`127.0.0.1`, `localhost`,
-  its hostname, an IP address): a page on another site cannot reach it by pointing a name of its own at `127.0.0.1`
-  (DNS rebinding). A tunnel or another name for it goes into `"allowed_hosts": ["name"]` in the config, or set a key.
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   in an admin PowerShell, and make sure the network is set to Private.
