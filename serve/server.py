@@ -1758,13 +1758,23 @@ def main() -> int:
         while not stop.wait(1.0):
             pass
     except KeyboardInterrupt:
-        httpd.shutdown()
-        if hasattr(engine, "close"):
-            engine.close()
-        if vision:
-            vision.close()
-        if hub is not None:
-            hub.close()
+        print("\n[strata] stopping (the engine frees its memory; a second Ctrl+C ends it at once) ...", flush=True)
+        # The engine's QUIT can take a few seconds (it unlocks 35-55 GB of RAM); a second Ctrl+C meanwhile used to
+        # land as a traceback in the middle of this cleanup.  Now it kills the engine and the rest goes on.
+        steps = [httpd.shutdown, engine.close if hasattr(engine, "close") else None,
+                 vision.close if vision else None, hub.close if hub is not None else None]
+        for step in steps:
+            if step is None:
+                continue
+            try:
+                step()
+            except KeyboardInterrupt:
+                proc = getattr(engine, "proc", None)
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:                           # noqa: BLE001 - nothing to do about it while leaving
+                pass
+        print("[strata] stopped", flush=True)
     return 0
 
 
