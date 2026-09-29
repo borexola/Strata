@@ -263,14 +263,14 @@ def _cpuid_avx512_full() -> bool:
 
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,display_active",
              "--format=csv,noheader,nounits"])
     found = []
     for line in s.strip().splitlines():
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
+            idx, name, mem, cc, drv, disp = ([x.strip() for x in line.split(",")] + ["?"])[:6]
             found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+                          "driver": drv, "display": disp.lower() == "enabled"})
         except ValueError:
             continue
     return found
@@ -1449,6 +1449,12 @@ def main() -> int:
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    elif gpu.get("display") and gpu["vram_gb"] >= 20:
+        # The card also drives the monitors: the desktop and the browser take VRAM that comes and goes (a few GB
+        # on a big desktop), and a cache sized to the free VRAM of one instant gets cut back when it is written.
+        # A larger reserve on a card with room for it (1.5 GB; the default is 700 MiB) keeps the cache steady.
+        args += ["--vram-reserve-mib", "1536"]
+        ok("this card drives a display: 1.5 GB of VRAM is left for it (--vram-reserve-mib 1536)")
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
