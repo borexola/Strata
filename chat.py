@@ -16,20 +16,31 @@ import mimetypes
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 
-def stream(url, messages, think, max_tokens):
+def stream(url, messages, think, max_tokens, api_key=""):
     body = {"model": "strata", "messages": messages, "stream": True, "max_tokens": max_tokens,
             "reasoning_effort": think}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
-            d = json.loads(line[6:])["choices"][0]["delta"]
+            obj = json.loads(line[6:])
+            if "error" in obj:                          # the engine stopped or refused mid-stream
+                raise ServerError(str((obj["error"] or {}).get("message") or obj["error"]))
+            d = obj["choices"][0]["delta"]
             yield d.get("reasoning_content") or "", d.get("content") or ""
+
+
+class ServerError(Exception):
+    pass
 
 
 def main() -> int:
@@ -40,6 +51,8 @@ def main() -> int:
                     help="how long the model thinks before answering (none = answer directly)")
     ap.add_argument("--no-think", action="store_true", help="same as --think none")
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
+                    help="the server's API key, if it was started with one (also $STRATA_API_KEY)")
     a = ap.parse_args()
     url = f"http://{a.host}:{a.port}/v1/chat/completions"
     gray, reset = ("\033[90m", "\033[0m") if sys.stdout.isatty() else ("", "")
@@ -88,7 +101,7 @@ def main() -> int:
         print("model> ", end="", flush=True)
         try:
             in_think = False
-            for reasoning, content in stream(url, messages, think, a.max_tokens):
+            for reasoning, content in stream(url, messages, think, a.max_tokens, a.api_key):
                 if reasoning:
                     if not in_think:
                         print(gray, end="")
@@ -103,8 +116,25 @@ def main() -> int:
                 n += 1
             if in_think:
                 print(reset, end="")
+        except KeyboardInterrupt:                       # Ctrl+C stops this answer, not the chat (the server
+            print(reset + "\n(stopped)")               # cancels the request when the connection closes)
+            if not answer:
+                messages.pop()
+                continue
+        except urllib.error.HTTPError as e:             # the server's own message (a 400, a 401, a 503)
+            try:
+                msg = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+            except ValueError:
+                msg = ""
+            print(reset + f"\n(the server answered {e.code}: {msg or e.reason})")
+            messages.pop()
+            continue
+        except ServerError as e:
+            print(reset + f"\n(server error: {e})")
+            messages.pop()
+            continue
         except OSError as e:
-            print(f"\n(could not reach the server at {url}: {e})")
+            print(reset + f"\n(could not reach the server at {url}: {e})")
             messages.pop()
             continue
         dt = time.time() - t0

@@ -526,5 +526,125 @@ class WebApp(unittest.TestCase):
             self.svc.api_key = ""
 
 
+class Hardening(unittest.TestCase):
+    """Every request gets an answer; what a page elsewhere or another device may reach."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def post(self, path, body, headers=None, raw=False):
+        data = body if raw else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data,
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_bad_bodies_get_a_400_not_a_dropped_socket(self):
+        cases = [[], None, {"messages": []}, {"messages": [{"role": "function", "content": "x"}]},
+                 {"messages": [{"role": "user", "content": "hi"}], "max_tokens": [1]},
+                 {"messages": [{"role": "user", "content": "hi"}], "tools": [1]}]
+        for body in cases:
+            with self.subTest(body=body):
+                code, err = self.post("/v1/chat/completions", body)
+                self.assertIn(code, (400, 500), err)
+                self.assertIn("error", err)
+
+    def test_json_only_and_a_bounded_body(self):
+        code, err = self.post("/v1/chat/completions", b'{"messages": []}', headers={"Content-Type": "text/plain"}, raw=True)
+        self.assertEqual(code, 415, err)
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=b"{}",
+                                     headers={"Content-Type": "application/json", "Content-Length": str(1 << 30)})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("a 1 GB body was accepted")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 413)
+        except OSError:
+            pass                                          # the server closed the connection: also refused
+
+    def test_status_needs_the_key_when_one_is_set(self):
+        self.svc.api_key = "secret"
+        try:
+            self.assertEqual(urllib.request.urlopen(self.base + "/health", timeout=10).status, 200)
+            try:
+                urllib.request.urlopen(self.base + "/status", timeout=10)
+                self.fail("/status answered without the key")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 401)
+        finally:
+            self.svc.api_key = ""
+
+    def test_a_foreign_host_name_is_refused_without_a_key(self):
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
+        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "evil.example:8080"})[0], 403)
+        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "localhost:8080"})[0], 200)
+        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "192.168.1.20:8080"})[0], 200)
+        self.svc.allowed_hosts = {"mypc.lan"}
+        try:
+            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "mypc.lan:8080"})[0], 200)
+        finally:
+            self.svc.allowed_hosts = set()
+        self.svc.api_key = "secret"                       # with a key, the key is the protection
+        try:
+            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "evil.example",
+                                                                             "Authorization": "Bearer secret"})[0], 200)
+        finally:
+            self.svc.api_key = ""
+
+    def test_the_detokenizer_matches_a_whole_decode(self):
+        from serve.server import Detokenizer
+        tok = ByteTokenizer()
+        text = "a\u00e9\u6f22\u5b57\U0001f600 b <|im_end|>"
+        ids = tok.encode(text, parse_special=True)
+        ids.insert(3, 0xC3)                               # a stray lead byte, as a bad token could give
+        d = Detokenizer(tok)
+        self.assertEqual("".join(d.push(t) for t in ids), tok.decode(ids))
+
+    def test_a_malformed_tool_call_is_content_not_an_error(self):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=False, tools=[{"name": "f", "parameters": {}}], stream_tools=True)
+        evs = p.feed('<tool_call>{"name": "f", "arguments": {}}</tool_call>') + p.finish()
+        self.assertTrue(all(e.kind != "tool_call" for e in evs), evs)
+        self.assertIn("tool_call", "".join(e.text for e in evs if e.kind == "content"))
+
+
+class GpuPin(unittest.TestCase):
+    def test_a_stale_pin_is_dropped(self):
+        import tempfile
+        from serve import server as S
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "strata-x.json"
+            path.write_text(json.dumps({"gpu": 1, "args": []}))
+            cfg = {"gpu": 1, "args": [], "_path": str(path)}
+            old = S.nvidia_gpu_indices
+            S.nvidia_gpu_indices = lambda: [0]
+            try:
+                S.check_gpu(cfg)
+            finally:
+                S.nvidia_gpu_indices = old
+            self.assertNotIn("gpu", cfg)
+            self.assertNotIn("gpu", json.loads(path.read_text()))
+            cfg = {"gpu": 2, "args": []}
+            S.nvidia_gpu_indices = lambda: [0, 1]
+            try:
+                S.check_gpu(cfg)
+            finally:
+                S.nvidia_gpu_indices = old
+            self.assertEqual(cfg["gpu"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

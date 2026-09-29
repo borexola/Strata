@@ -902,6 +902,8 @@ int main(int argc, char** argv) {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
             o.prefill_chunk = o.prefill_auto ? 8192 : std::atoll(v.c_str());
+            // the chunk is a grid's y dimension in the prompt kernels (65,535 at most)
+            if (o.prefill_chunk > 65535) o.prefill_chunk = 65535;
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
@@ -1507,6 +1509,12 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    for (int64_t t : o.tokens)   // the CLI's --tokens: an id past the table read past the embedding rows
+        if (t < 0 || t >= n_vocab) {
+            std::fprintf(stderr, "strata generate: token id %lld is outside the vocabulary (%lld)\n", (long long) t,
+                         (long long) n_vocab);
+            return 2;
+        }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty()) {
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
@@ -2509,7 +2517,9 @@ int main(int argc, char** argv) {
             c.imgs = imgs_below(req_imgs, L);
             if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
             c.used = ++check_clock;
-            checks.push_back(std::move(c));
+            checks.insert(std::find_if(checks.begin(), checks.end(),
+                                       [&](const ConvCheckpoint& k) { return k.ids.size() > c.ids.size(); }),
+                          std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
                 std::vector<uint64_t> stamps;
                 stamps.reserve(checks.size());
@@ -2549,7 +2559,10 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        if (cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+            std::fprintf(stderr, "strata: cannot create the refill event (%s)\n", cudaGetErrorString(cudaGetLastError()));
+            return 1;
+        }
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -2793,15 +2806,38 @@ int main(int argc, char** argv) {
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
+            // the values come from a network client through the server: NaN/inf make the chain pick at random
+            // (inv_t = 0), a zero or negative repeat penalty divides logits by it
+            if (!std::isfinite(req_temperature) || !std::isfinite(req_top_p) || !std::isfinite(req_min_p) ||
+                !std::isfinite(req_penalty_repeat) || !std::isfinite(req_penalty_freq) ||
+                !std::isfinite(req_penalty_present) || req_penalty_repeat <= 0.0f || req_temperature < 0.0f) {
+                std::printf("ERR bad request: a sampling value is not finite or out of range\n");
+                std::fflush(stdout);
+                continue;
+            }
             std::string emb_path;
             if (geni && endp != nullptr) {
                 while (*endp == ' ') ++endp;
-                char* gap = std::strchr(endp, ' ');
-                if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
+                // The path may contain spaces (a Windows temp folder under a user name with one): it ends where the
+                // ids begin, and the ids are the trailing run of integer tokens - walk them from the end.
+                char* q = endp + std::strlen(endp);
+                while (q > endp && (q[-1] == ' ' || q[-1] == '\n' || q[-1] == '\r')) --q;
+                for (;;) {
+                    char* ts = q;
+                    while (ts > endp && ts[-1] != ' ') --ts;
+                    bool integer = ts < q;
+                    for (const char* c = ts; c < q; ++c) integer = integer && *c >= '0' && *c <= '9';
+                    if (!integer) break;
+                    q = ts;
+                    while (q > endp && q[-1] == ' ') --q;
+                }
+                emb_path.assign(endp, (size_t) (q - endp));
+                endp = q;
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+            if (max_new < 1 || max_new > o.max_context || endp == nullptr || (geni && emb_path.empty()) ||
+                !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
@@ -2831,7 +2867,7 @@ int main(int argc, char** argv) {
                         const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
                         if (got == 0) break;
                         if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
-                            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
+                            (int64_t) hdr[1] > n || (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
                             ve = "bad embeddings file (expected strata-vision records of width " +
                                  std::to_string((long long) g.n_embd) + ")";
                             break;
@@ -3215,6 +3251,18 @@ int main(int argc, char** argv) {
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                {
+                    // only the run the client sees is committed: up to max_new, and up to the end-of-turn token
+                    // (which itself stays uncommitted, as it does when it is the last accepted one), so the live
+                    // state is a prefix of the next turn's prompt
+                    int keep = (int) std::min<int64_t>((int64_t) a + 1, std::max<int64_t>(1, max_new - produced_n));
+                    for (int i = 0; i < keep; ++i)
+                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                            keep = i + 1;
+                            break;
+                        }
+                    a = keep - 1;
+                }
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
@@ -3760,7 +3808,10 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        if (cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+            std::fprintf(stderr, "strata: cannot create the refill event (%s)\n", cudaGetErrorString(cudaGetLastError()));
+            return 1;
+        }
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);

@@ -391,7 +391,10 @@ helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your st
 | CPU | 10-30 s (pictures are scaled down to ~300 image tokens) | nothing on the GPU |
 
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300). The same picture sent again, as chat apps
-do on every turn, is encoded only once.
+do on every turn, is encoded only once. A request with a picture decodes greedily: the engine's image path takes no
+sampling fields (the request's temperature, top_p, penalties and the config's `sampling` defaults are ignored for it).
+Local file paths as image sources are accepted from clients on the same PC only; other devices send a `data:` URL or an
+`http(s)` URL (fetched by the server, 32 MB at most).
 
 ### Sending a picture
 

@@ -50,7 +50,8 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncthreads();
+    // (no barrier: rows 1..7 returned above, and a barrier after an exited warp is undefined; nothing here
+    // shares memory across warps)
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);

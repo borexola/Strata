@@ -546,8 +546,11 @@ __global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long lon
     __shared__ float xs_d[GMAX][H / 32];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    // a group holds a window's entries for one expert: at most the window's tokens (<= GMAX) today, but a wider
+    // window would have silently dropped entries GMAX.. - so the group is walked in slices of GMAX
+    for (int e0 = grp_start[g]; e0 < grp_start[g + 1]; e0 += GMAX) {
+    const int ne = min(grp_start[g + 1] - e0, GMAX);
     for (int i = t; i < ne * (H / 32); i += blockDim.x) {
         const int k = i / (H / 32), c = i - k * (H / 32);
         const uint8_t* xb = x_q8_0 + (size_t) ent_tok[e0 + k] * (size_t) (H / 32) * 34 + (size_t) c * 34;
@@ -593,6 +596,8 @@ __global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long lon
             }
         }
     }
+    __syncthreads();   // the next slice restages xs_*
+    }
 }
 
 // Down: a block = D_ROWS rows of ONE group; the entries' quantized intermediates staged once.  A down row is 20
@@ -608,8 +613,9 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
     __shared__ float hs_d[GMAX][FF / 32];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    for (int e0 = grp_start[g]; e0 < grp_start[g + 1]; e0 += GMAX) {   // slices of GMAX, as in gu_grouped_kernel
+    const int ne = min(grp_start[g + 1] - e0, GMAX);
     for (int i = t; i < ne * (FF / 32); i += blockDim.x) {
         const int k = i / (FF / 32), c = i - k * (FF / 32);
         const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) (FF / 32) * 34 + (size_t) c * 34;
@@ -642,6 +648,8 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
             const float sum = warp_sum(acc);
             if (lane == 0) out[(size_t) ent_dst[e0 + k] * H + r] = sum;
         }
+    }
+    __syncthreads();   // the next slice restages hs_*
     }
 }
 }  // namespace

@@ -25,14 +25,19 @@ import collections
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
+import math
 import os
 import queue
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +47,8 @@ from typing import Iterator, Protocol
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+import jinja2  # noqa: E402
+
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -227,6 +234,11 @@ class StrataEngine:
             self.proc.kill()
         except OSError:
             pass
+        if self.log is not subprocess.DEVNULL:          # the dead process's stderr: one handle per restart otherwise
+            try:
+                self.log.close()
+            except OSError:
+                pass
         info = dict(self.info)
         self.ended = False
         self.__init__(*self.spawn)
@@ -244,6 +256,13 @@ class StrataEngine:
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        # a NaN or infinite value from a client would reach the sampler as one (uniform picks, divided logits):
+        # such fields, and a repeat penalty that is not positive, count as absent
+        num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)   # noqa: E731
+        sampling = {k: (v if num(v) or not isinstance(v, (int, float)) or isinstance(v, bool) else None)
+                    for k, v in sampling.items()}
+        if not (num(sampling.get("repetition_penalty")) and sampling["repetition_penalty"] > 0):
+            sampling["repetition_penalty"] = None
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -376,7 +395,7 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=self.temp_root(cfg)))
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
         line = self.proc.stdout.readline()
@@ -385,16 +404,57 @@ class Vision:
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
+    MAX_BYTES = 32 << 20                               # an image over 32 MB is refused, not downloaded
+
     @staticmethod
-    def load(source: str) -> bytes:
+    def temp_root(cfg: dict) -> str | None:
+        """Where the embeddings files go: the engine reads the path from its GENI line up to the first space, and
+        the encoder's ENC line splits at the last one, so a temp folder with a space in its path (a Windows user
+        name with a space, without 8.3 names) breaks every image request.  The first folder without one is used:
+        the system temp, the Strata folder (the log's), the current folder."""
+        for cand in (tempfile.gettempdir(), Path(cfg["log"]).parent if cfg.get("log") else None,
+                     Path(cfg["model"]).parent if cfg.get("model") else None, Path.cwd()):
+            if cand is not None and " " not in str(cand) and Path(cand).is_dir():
+                return str(cand)
+        print("[strata] WARNING: every temp folder's path has a space in it; image requests will fail", flush=True)
+        return None
+
+    @classmethod
+    def load(cls, source: str, allow_files: bool = True) -> bytes:
+        """The image's bytes: a data: URL, an http(s) URL fetched here, or (for clients on this PC only) a file."""
         if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
+            if "," not in source:
+                raise ValueError("a data: URL needs a comma before its base64 data")
+            try:
+                data = base64.b64decode(source.split(",", 1)[1], validate=False)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"the image's base64 data could not be decoded ({e})") from None
+            if len(data) > cls.MAX_BYTES:
+                raise ValueError(f"the image is larger than {cls.MAX_BYTES >> 20} MB")
+            return data
         if source.startswith(("http://", "https://")):
+            host = urllib.parse.urlsplit(source).hostname or ""
+            try:                                        # never the link-local range (cloud metadata services)
+                for info in socket.getaddrinfo(host, None):
+                    if ipaddress.ip_address(info[4][0]).is_link_local:
+                        raise ValueError("the image URL points at a link-local address")
+            except socket.gaierror as e:
+                raise ValueError(f"the image URL's host is unknown ({e})") from None
             req = urllib.request.Request(source, headers={"User-Agent": "strata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = r.read(cls.MAX_BYTES + 1)
+            except OSError as e:                        # URLError, HTTPError, timeouts
+                raise ValueError(f"the image could not be fetched from {host} ({e})") from None
+            if len(data) > cls.MAX_BYTES:
+                raise ValueError(f"the image is larger than {cls.MAX_BYTES >> 20} MB")
+            return data
+        if not allow_files:
+            raise ValueError("an image must be a data: URL or an http(s) URL (file paths only from this PC)")
         path = source[7:] if source.startswith("file://") else source
         if path and os.path.isfile(path):
+            if os.path.getsize(path) > cls.MAX_BYTES:
+                raise ValueError(f"the image is larger than {cls.MAX_BYTES >> 20} MB")
             return Path(path).read_bytes()
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
@@ -426,18 +486,25 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str) -> tuple[Path, int]:
+    def encode(self, source: str, allow_files: bool = True) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
+        return self.encode_bytes(self.normalize(self.load(source, allow_files)))
+
+    def encode_bytes(self, data: bytes) -> tuple[Path, int]:
+        """The encoder's round trip for an image already fetched and normalized (`load`, `normalize`): the part
+        that needs the GPU, so the part the caller serializes with the engine's requests."""
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
-            self.proc.stdin.write(f"ENC {img} {out}\n")
-            self.proc.stdin.flush()
-            line = self.proc.stdout.readline().strip()
+            try:
+                self.proc.stdin.write(f"ENC {img} {out}\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline().strip()
+            except OSError:                             # the encoder process is gone
+                line = ""
             img.unlink(missing_ok=True)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
@@ -455,6 +522,7 @@ class Vision:
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)    # the cached embeddings (several MB each)
 
 
 def nvidia_gpu_indices() -> list[int] | None:
@@ -570,6 +638,7 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.allowed_hosts: set[str] = set()           # host names this server answers to without a key (config)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -660,7 +729,7 @@ class Service:
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, local: bool = True):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -672,12 +741,15 @@ class Service:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            # The fetch and the format conversion first, outside the FIFO: a slow image URL must not hold the
+            # engine for every queued request.  Local file paths only for clients on this PC.
+            datas = [self.vision.normalize(self.vision.load(src, allow_files=local)) for src in images]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                encoded = [self.vision.encode_bytes(d) for d in datas]
             out, k = [], 0
             for t in ids:                               # one <|image_pad|> per image -> one per image token
                 if t == pad and k < len(encoded):
@@ -693,18 +765,28 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        room = self.engine.max_context - CTX_SLACK - len(ids)
+        try:
+            max_new = self._fit(len(ids), max_new)
+        except ValueError:
+            if images:                                  # the request is refused: its embeddings file goes too
+                Path(self.embeddings.path).unlink(missing_ok=True)
+                self.embeddings.path = None
+            raise
+        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def _fit(self, n_prompt: int, max_new) -> int:
+        room = self.engine.max_context - CTX_SLACK - n_prompt
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                raise ValueError(f"prompt ({n_prompt} tokens) leaves no room to answer in the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                raise ValueError(f"prompt ({n_prompt} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return max_new
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1206,6 +1288,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key)})
             elif path == "/status":
+                if not self._authorized():              # it shows the text being written (issue: any LAN client could read it)
+                    return
                 with svc.status_lock:
                     s = dict(svc.status)
                 now = time.time()
@@ -1222,25 +1306,96 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        MAX_BODY = 64 << 20                              # images travel base64-inline: generous, but bounded
+
+        def _local(self) -> bool:
+            return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+        def _host_ok(self) -> bool:
+            """Without an API key the only thing between a web page elsewhere and this server is the browser's
+            same-origin rule, and DNS rebinding gets around it (a page at evil.example whose name is then pointed
+            at 127.0.0.1 sends its requests with Host: evil.example).  So the Host must be one of this PC's own
+            names: localhost, its addresses, the bound host, or the config's "allowed_hosts"."""
+            if svc.api_key:
+                return True
+            host = self.headers.get("Host", "")
+            name = host.rsplit(":", 1)[0] if host.count(":") == 1 or host.startswith("[") else host
+            name = name.strip("[]").lower()
+            if name in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "") or name in svc.allowed_hosts:
+                return True
+            try:
+                ip = ipaddress.ip_address(name)          # a LAN address of this PC (or any address: the attacker's
+                if ip.is_private or ip.is_loopback:      # page cannot point its own name at it AND set that host)
+                    return True
+            except ValueError:
+                pass
+            self._json(403, {"error": {"message": f"the host name {host!r} is not one this server answers to: use "
+                                                  "127.0.0.1, its IP address, or add it to \"allowed_hosts\" in the "
+                                                  "config (or set an API key)"}})
+            return False
+
+        def _body(self) -> bytes | None:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "bad Content-Length"}})
+                return None
+            if length > self.MAX_BODY:
+                self._json(413, {"error": {"type": "invalid_request_error",
+                                           "message": f"the request body is over {self.MAX_BODY >> 20} MB"}})
+                return None
+            return self.rfile.read(length)
+
         def do_POST(self):
-            if not self._authorized():
+            if not self._authorized() or not self._host_ok():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path == "/settings":
                 self._settings()
                 return
+            if path not in ("/v1/chat/completions", "/v1/messages"):
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            # JSON only: a form on a web page elsewhere can post text/plain to a local server without a CORS
+            # preflight; SDK clients always send application/json
+            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                self._json(415, {"error": {"type": "invalid_request_error", "message": "send Content-Type: application/json"}})
+                return
+            body = self._body()
+            if body is None:
+                return
+            self.streaming = False
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("the request body must be a JSON object")
                 if path == "/v1/chat/completions":
                     self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
                 else:
-                    self._json(404, {"error": {"message": "not found"}})
-            except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    self._anthropic(req)
+            except (ValueError, jinja2.TemplateError) as e:   # the chat template's raise_exception() too
+                self._fail(400, "invalid_request_error", str(e))
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._fail(503, "server_error", f"{e}; the next request restarts it")
+            except (OSError, GeneratorExit):                 # the client went away
+                raise
+            except Exception as e:                           # anything else: an answer, not a dropped socket
+                import traceback
+                traceback.print_exc()
+                self._fail(500, "server_error", f"{type(e).__name__}: {e}")
+
+        def _fail(self, code, kind, message):
+            """An error as a JSON response - or, when the stream has started, as its last frame."""
+            if getattr(self, "streaming", False):
+                try:
+                    self.wfile.write(b"data: " + json.dumps({"error": {"type": kind, "message": message}}).encode()
+                                     + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    pass
+                return
+            self._json(code, {"error": {"type": kind, "message": message}})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -1256,8 +1411,8 @@ def make_handler(svc: Service):
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            if not self._own_page("settings can be changed"):
+            body = self._body()
+            if body is None or not self._own_page("settings can be changed"):
                 return
             try:
                 req = json.loads(body or b"{}")
@@ -1270,6 +1425,7 @@ def make_handler(svc: Service):
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
+            self.streaming = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -1288,7 +1444,7 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, local=self._local())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -1319,7 +1475,7 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, local=self._local())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
@@ -1578,6 +1734,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.allowed_hosts = {str(h).lower() for h in (cfg.get("allowed_hosts") or [])}
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
@@ -1620,7 +1777,9 @@ def main() -> int:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     try:
-        threading.Event().wait()
+        stop = threading.Event()                        # a timed wait: Windows delivers Ctrl+C only between waits
+        while not stop.wait(1.0):
+            pass
     except KeyboardInterrupt:
         httpd.shutdown()
         if hasattr(engine, "close"):

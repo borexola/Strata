@@ -12,6 +12,19 @@
 namespace strata::kernels {
 namespace {
 
+// the device's SM count, for the grid-stride kernels below: `48 * 8` blocks were sized for a 48-SM card and
+// leave two thirds of a 170-SM one idle on the PCIe stagers
+int blocks_per_device(int per_sm) {
+    static int sms = 0;
+    if (sms <= 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0)
+            sms = 48;
+    }
+    return sms * per_sm;
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -113,7 +126,9 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
         const int j = (int) (((long long) hand + threadIdx.x) % n);
         const bool mine = m.slot_stamp[j] == epoch;
-        const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
+        // a ring smaller than the block would map two threads onto one slot (both could take it as a victim):
+        // only the first `n` threads look
+        const bool cand = (int) threadIdx.x < n && !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
         int total = 0;
         const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
         const int want = need - got;
@@ -211,7 +226,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    copy_kernel<<<(unsigned) blocks_per_device(2), 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
 }
 
