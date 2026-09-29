@@ -23,6 +23,10 @@
 
 namespace strata::kernels {
 
+/// The device's multiprocessor count, read once (48 when it cannot be read).  The engine calls it at startup, before
+/// any graph capture, so the grid-stride launches that size themselves by it never query the device mid-capture.
+int device_sm_count();
+
 /// Decode one canonical embedding row already selected by the caller. Codes are
 /// packed low bits first (2, 4 or 8 bits); scales/offsets are FP32 per group.
 /// The optional offset defaults to +0. Multiplication and addition round separately,

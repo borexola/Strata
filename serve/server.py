@@ -450,7 +450,8 @@ class Vision:
                 raise ValueError(f"the image is larger than {cls.MAX_BYTES >> 20} MB")
             return data
         if not allow_files:
-            raise ValueError("an image must be a data: URL or an http(s) URL (file paths only from this PC)")
+            raise ValueError("an image must be a data: URL or an http(s) URL (a file path only from this PC, or "
+                             "with the server's API key)")
         path = source[7:] if source.startswith("file://") else source
         if path and os.path.isfile(path):
             if os.path.getsize(path) > cls.MAX_BYTES:
@@ -639,6 +640,7 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.allowed_hosts: set[str] = set()           # host names this server answers to without a key (config)
+        self.bind_host = "127.0.0.1"                   # where it listens: the Host check applies to a local server only
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -648,6 +650,21 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def own_names(self) -> set[str]:
+        """This PC's own names (its hostname, with and without a domain, and its .local name): a browser on this PC
+        reaching http://<hostname>:8080 is not a page from elsewhere."""
+        names = getattr(self, "_own_names", None)
+        if names is None:
+            import socket
+            names = set()
+            for n in (socket.gethostname(), socket.getfqdn()):
+                if n:
+                    names.add(n.lower())
+                    names.add(n.split(".")[0].lower())
+                    names.add(n.split(".")[0].lower() + ".local")
+            self._own_names = names
+        return names
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1309,19 +1326,21 @@ def make_handler(svc: Service):
         MAX_BODY = 64 << 20                              # images travel base64-inline: generous, but bounded
 
         def _local(self) -> bool:
-            return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+            """May this client name files on this PC's disk as images: it is on this PC, or it holds the key."""
+            return bool(svc.api_key) or self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
         def _host_ok(self) -> bool:
             """Without an API key the only thing between a web page elsewhere and this server is the browser's
             same-origin rule, and DNS rebinding gets around it (a page at evil.example whose name is then pointed
             at 127.0.0.1 sends its requests with Host: evil.example).  So the Host must be one of this PC's own
             names: localhost, its addresses, the bound host, or the config's "allowed_hosts"."""
-            if svc.api_key:
-                return True
+            if svc.api_key or svc.bind_host not in ("127.0.0.1", "localhost", "::1", ""):
+                return True                              # a key protects it; a network server answers to any name
             host = self.headers.get("Host", "")
             name = host.rsplit(":", 1)[0] if host.count(":") == 1 or host.startswith("[") else host
             name = name.strip("[]").lower()
-            if name in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "") or name in svc.allowed_hosts:
+            if name in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "") or name in svc.allowed_hosts \
+                    or name in svc.own_names():
                 return True
             try:
                 ip = ipaddress.ip_address(name)          # a LAN address of this PC (or any address: the attacker's
@@ -1358,10 +1377,12 @@ def make_handler(svc: Service):
             if path not in ("/v1/chat/completions", "/v1/messages"):
                 self._json(404, {"error": {"message": "not found"}})
                 return
-            # JSON only: a form on a web page elsewhere can post text/plain to a local server without a CORS
-            # preflight; SDK clients always send application/json
-            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
-                self._json(415, {"error": {"type": "invalid_request_error", "message": "send Content-Type: application/json"}})
+            # A web page elsewhere can post a form (or a no-cors fetch) to a local server without a CORS preflight,
+            # and the browser then always sends its Origin: one from another site is refused.  Scripts and SDKs
+            # send no Origin (and need no particular Content-Type: a client without the header keeps working).
+            origin = self.headers.get("Origin", "")
+            if origin and origin.split("://", 1)[-1].lower() != self.headers.get("Host", "").lower():
+                self._json(403, {"error": {"type": "permission_error", "message": "requests from another web page are refused"}})
                 return
             body = self._body()
             if body is None:
@@ -1735,6 +1756,7 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.allowed_hosts = {str(h).lower() for h in (cfg.get("allowed_hosts") or [])}
+    svc.bind_host = a.host
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

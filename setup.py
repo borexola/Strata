@@ -1022,14 +1022,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         del a[i:i + 2]
         changed = True
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
-    if "sampling" not in cfg:                          # configs before the sampling defaults: API clients decoded greedy
-        cfg["sampling"] = dict(SAMPLING_DEFAULTS)
-        changed = True
-        ok("sampling defaults for API clients that send none: " + ", ".join(f"{k} {v}" for k, v in SAMPLING_DEFAULTS.items()))
-    if "fit_max_tokens" not in cfg:
-        cfg["fit_max_tokens"] = True
-        changed = True
-        ok("a request whose max_tokens does not fit the context gets a shorter answer instead of an error")
+    # (a config from before the sampling defaults and "fit_max_tokens" is left as it is: those change what API
+    # clients get, so an existing install keeps its behaviour until --setup writes a new config)
     if cfg.get("gpu") is not None:                     # pinned to a card this PC no longer has (a rebuild around one GPU)
         found = gpus()
         if found and cfg["gpu"] not in [g["index"] for g in found]:

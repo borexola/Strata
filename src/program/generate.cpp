@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -1546,6 +1547,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
     }
+    strata::kernels::device_sm_count();   // read once here, before any graph capture (the stagers size by it)
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     std::vector<int64_t> sized_slots;

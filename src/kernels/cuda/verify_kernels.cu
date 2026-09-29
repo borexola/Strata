@@ -4,6 +4,8 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
 
+#include "strata/kernels/elementwise.hpp"   // device_sm_count: the stagers' grids scale with the card
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -11,19 +13,6 @@
 
 namespace strata::kernels {
 namespace {
-
-// the device's SM count, for the grid-stride kernels below: `48 * 8` blocks were sized for a 48-SM card and
-// leave two thirds of a 170-SM one idle on the PCIe stagers
-int blocks_per_device(int per_sm) {
-    static int sms = 0;
-    if (sms <= 0) {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0)
-            sms = 48;
-    }
-    return sms * per_sm;
-}
 
 constexpr int S = 128;          // GDN state size
 constexpr int RG = 4;
@@ -320,7 +309,7 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<(unsigned) blocks_per_device(8), 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    fetch_blobs_kernel<<<(unsigned) (device_sm_count() * 8), 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
@@ -350,7 +339,7 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
-    const unsigned blocks = (unsigned) blocks_per_device(8);
+    const unsigned blocks = (unsigned) (device_sm_count() * 8);   // 48 * 8 on the card it was tuned on
     if (row_bytes % 16 == 0)
         gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
     else if (row_bytes % 4 == 0)

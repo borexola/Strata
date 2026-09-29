@@ -562,9 +562,12 @@ class Hardening(unittest.TestCase):
                 self.assertIn(code, (400, 500), err)
                 self.assertIn("error", err)
 
-    def test_json_only_and_a_bounded_body(self):
-        code, err = self.post("/v1/chat/completions", b'{"messages": []}', headers={"Content-Type": "text/plain"}, raw=True)
-        self.assertEqual(code, 415, err)
+    def test_a_foreign_origin_is_refused_and_a_bounded_body(self):
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
+        # a browser sends Origin on every cross-origin POST (forms included); a script sends none and any content type
+        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.post("/v1/chat/completions", json.dumps(body).encode(),
+                                   headers={"Content-Type": "text/plain"}, raw=True)[0], 200)
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=b"{}",
                                      headers={"Content-Type": "application/json", "Content-Length": str(1 << 30)})
         try:
@@ -588,10 +591,17 @@ class Hardening(unittest.TestCase):
             self.svc.api_key = ""
 
     def test_a_foreign_host_name_is_refused_without_a_key(self):
+        import socket
         body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
         self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "evil.example:8080"})[0], 403)
         self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "localhost:8080"})[0], 200)
         self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "192.168.1.20:8080"})[0], 200)
+        self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": socket.gethostname() + ":8080"})[0], 200)
+        self.svc.bind_host = "0.0.0.0"                     # opened to the network: reached by whatever name the user chose
+        try:
+            self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "gaming-pc.tail1234.ts.net"})[0], 200)
+        finally:
+            self.svc.bind_host = "127.0.0.1"
         self.svc.allowed_hosts = {"mypc.lan"}
         try:
             self.assertEqual(self.post("/v1/chat/completions", body, headers={"Host": "mypc.lan:8080"})[0], 200)
